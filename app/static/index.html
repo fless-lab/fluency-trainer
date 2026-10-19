@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fluency Trainer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">Fluency Trainer</div>
+    <div class="badges">
+      <span id="day-badge" class="badge"></span>
+      <span id="provider-badge" class="badge"></span>
+    </div>
+  </header>
+  <div id="banner" class="banner" hidden></div>
+  <nav class="tabs" id="tabs">
+    <button data-tab="today" class="active">Today</button>
+    <button data-tab="history">History</button>
+    <button data-tab="progress">Progress</button>
+    <button data-tab="data">Data</button>
+  </nav>
+  <main id="view"></main>
+  <div id="overlay" class="overlay" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
