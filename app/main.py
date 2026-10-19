@@ -165,6 +165,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             response = await call_next(request)
             status = response.status_code
+            if request.url.path == "/" or request.url.path.startswith("/static/"):
+                # always revalidate the page and its scripts, so an updated app is never shadowed by a stale cached copy
+                response.headers["Cache-Control"] = "no-cache"
             return response
         finally:
             if request.url.path.startswith("/api/"):

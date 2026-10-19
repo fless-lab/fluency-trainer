@@ -187,3 +187,8 @@ def test_event_log_download_is_a_consistent_snapshot(client):
     assert r.status_code == 200
     assert int(r.headers["content-length"]) == len(r.content)
     assert all(json.loads(line) for line in r.text.splitlines())
+
+
+def test_page_and_scripts_are_always_revalidated(client):
+    for path in ("/", "/static/app.js", "/static/style.css"):
+        assert client.get(path).headers["cache-control"] == "no-cache"
