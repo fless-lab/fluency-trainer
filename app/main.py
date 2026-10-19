@@ -7,7 +7,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date as Date, datetime
+from datetime import date as Date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import APP_VERSION
+from .coach import COACH_VERSION, MIN_WORDS, build_messages, parse_feedback
 from .config import Settings, load_settings
 from .db import DB
 from .eventlog import EventLog, utcnow
@@ -24,6 +25,10 @@ from .metrics import METRICS_VERSION, compute_metrics
 from .progress import build_drills, build_progress
 from .protocols import (CHECKPOINT_BY_ID, CHECKPOINTS, DRILL_PREP_SECONDS, DRILL_SECONDS, DRILL_TOPICS, PREP_SECONDS,
                         SPEAK_SECONDS, topics_for_checkpoint)
+from .llm.anthropic import AnthropicLLM
+from .llm.base import LLMError, LLMProvider
+from .llm.mock import MockLLM
+from .llm.openrouter import OpenRouterLLM
 from .providers.assemblyai import AssemblyAISTT
 from .providers.base import STTProvider
 from .providers.mock import MockSTT
@@ -83,6 +88,23 @@ def make_provider(settings: Settings) -> tuple[STTProvider | None, str | None]:
     return None, f"Unknown STT_PROVIDER '{settings.stt_provider}'"
 
 
+def make_llm(settings: Settings) -> tuple[LLMProvider | None, str | None]:
+    """Build the language model provider, or explain why there is none. The app works without one."""
+    name = settings.llm_provider
+    if name in ("", "none"):
+        return None, "No language model configured. Set LLM_PROVIDER, LLM_API_KEY and LLM_MODEL in .env to enable feedback."
+    if name == "mock":
+        return MockLLM(), None
+    if name in ("openrouter", "anthropic"):
+        if not settings.llm_key:
+            return None, "LLM_API_KEY is not set."
+        if not settings.llm_model:
+            return None, "LLM_MODEL is not set. Put the exact model name from your provider."
+        cls = OpenRouterLLM if name == "openrouter" else AnthropicLLM
+        return cls(settings.llm_key, settings.llm_model, settings.llm_base_url), None
+    return None, f"Unknown LLM_PROVIDER '{name}'. Use openrouter, anthropic or mock."
+
+
 def local_today() -> Date:
     return datetime.now().astimezone().date()
 
@@ -95,6 +117,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     db = DB(data / "fluency.db")
     events = EventLog(data / "events.jsonl")
     provider, provider_error = make_provider(settings)
+    llm, llm_error = make_llm(settings)
+    coach_locks: dict[str, asyncio.Lock] = {}
     semaphore = asyncio.Semaphore(2)
 
     async def process_session(sid: str) -> None:
@@ -225,6 +249,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "prep_seconds": PREP_SECONDS,
             "speak_seconds": SPEAK_SECONDS,
             "checkpoints": cps,
+            "llm": {"configured": llm is not None, "provider": llm.name if llm else None,
+                    "model": llm.model if llm else None, "error": llm_error},
             "drill_topics": DRILL_TOPICS,
             "drill_seconds": list(DRILL_SECONDS),
         }
@@ -394,6 +420,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sessions = db.list_sessions()
         metrics = {s["id"]: db.metrics_for(s["id"], METRICS_VERSION) for s in sessions if s["status"] == "done"}
         return build_progress(sessions, metrics, include_mock=include_mock)
+
+    @app.get("/api/sessions/{sid}/coach")
+    def get_coaching(sid: str) -> dict[str, Any]:
+        need_session(sid)
+        return {"coaching": db.latest_coaching(sid, COACH_VERSION)}
+
+    @app.post("/api/sessions/{sid}/coach")
+    async def make_coaching(sid: str, regenerate: bool = False) -> dict[str, Any]:
+        s = need_session(sid)
+        if llm is None:
+            raise HTTPException(503, llm_error or "No language model configured")
+        if s["status"] != "done" or not s["transcript_text"]:
+            raise HTTPException(409, "the session has no transcript yet")
+        lock = coach_locks.setdefault(sid, asyncio.Lock())
+        if lock.locked():
+            raise HTTPException(409, "feedback for this session is already being generated")
+        async with lock:
+            existing = db.latest_coaching(sid, COACH_VERSION)
+            if existing and not regenerate:
+                return {"coaching": existing, "reused": True}  # no new spend
+            since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="milliseconds")
+            if db.count_coaching_since(since) >= settings.coach_max_per_day:
+                events.write("coach.cap_reached", sid, cap=settings.coach_max_per_day)
+                raise HTTPException(429, f"Daily cap of {settings.coach_max_per_day} feedback requests reached (COACH_MAX_PER_DAY).")
+            if len(s["transcript_text"].split()) < MIN_WORDS:
+                raise HTTPException(422, f"too little speech to give useful feedback (under {MIN_WORDS} words)")
+            system, user = build_messages(s, db.metrics_for(sid, METRICS_VERSION), s["transcript_text"])
+            events.write("coach.start", sid, provider=llm.name, model=llm.model, version=COACH_VERSION)
+            started = time.monotonic()
+            try:
+                result = await llm.complete(system, user, 1800)
+            except LLMError as exc:
+                events.write("coach.error", sid, error=str(exc))
+                raise HTTPException(502, str(exc)) from exc
+            try:
+                content = parse_feedback(result.text, s["transcript_text"])
+            except ValueError as exc:
+                events.write("coach.unusable", sid, error=str(exc), raw=result.text[:2000], usage=result.usage)
+                raise HTTPException(502, f"The model's answer could not be used ({exc}). Try again.") from exc
+            db.add_coaching(sid, COACH_VERSION, result.provider, result.model, content, result.usage, result.text)
+            events.write("coach.done", sid, seconds=round(time.monotonic() - started, 2), provider=result.provider,
+                         model=result.model, usage=result.usage,
+                         quotes_not_found=sum(1 for p in content["patterns"] for e in p["examples"] if not e["quote_found"]))
+            return {"coaching": db.latest_coaching(sid, COACH_VERSION), "reused": False}
 
     def all_metrics() -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
         sessions = db.list_sessions()

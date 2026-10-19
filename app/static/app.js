@@ -388,11 +388,13 @@ function renderSessionDetail(container, detail) {
     <div class="legend">Pause chips: <span class="chip mid">mid-clause</span> <span class="chip boundary">clause boundary</span> <span class="chip long">over 1 s</span> · <span class="filler">fillers</span>. Classification is a heuristic.</div>
     <div class="card transcript">${renderTranscript(detail)}</div>
     ${detail.has_audio ? `<audio controls preload="none" src="/api/sessions/${esc(detail.id)}/audio" style="width:100%"></audio>` : ""}
+    <div id="coach"></div>
     <h3>How did it feel?</h3>
     <div class="row"><select id="fb-rating"><option value="">Rating…</option>${[1, 2, 3, 4, 5].map((n) => `<option value="${n}" ${detail.self_rating === n ? "selected" : ""}>${n}${n === 1 ? " (very hard)" : n === 5 ? " (easy)" : ""}</option>`).join("")}</select></div>
     <textarea id="fb-notes" placeholder="Notes: what blocked you, words you could not find, anything you avoided saying">${esc(detail.notes || "")}</textarea>
     <div class="row" style="margin-top:8px"><button class="secondary" id="fb-save">Save notes</button><span id="fb-msg" class="muted small"></span></div>`;
   container.appendChild(wrap);
+  setupCoach(wrap, detail);
   $("#fb-save", wrap).addEventListener("click", async () => {
     const rating = $("#fb-rating", wrap).value;
     try {
@@ -400,6 +402,56 @@ function renderSessionDetail(container, detail) {
       $("#fb-msg", wrap).textContent = "Saved.";
     } catch (e) { $("#fb-msg", wrap).textContent = `Not saved: ${e.message}`; }
   });
+}
+
+// ---------------------------------------------------------------- feedback from a language model
+function renderCoaching(body, c) {
+  const k = c.content;
+  const examples = (p) => p.examples.map((e) => `<div class="small" style="margin:4px 0 4px 12px"><span class="muted">You said:</span> “${esc(e.said)}”${e.quote_found ? "" : ' <span class="chip mid" title="The model quoted words that are not in the transcript">not found in transcript</span>'}<br><span class="muted">Better:</span> “${esc(e.better)}”</div>`).join("");
+  body.innerHTML = `
+    <p>${esc(k.summary)}</p>
+    ${k.strengths.length ? `<p class="small"><strong>What worked.</strong> ${k.strengths.map(esc).join(" ")}</p>` : ""}
+    ${k.patterns.map((p) => `<div class="card"><div class="tag">${esc(p.tag)}</div><p style="margin:4px 0">${esc(p.issue)}</p>${p.why ? `<p class="small muted" style="margin:0 0 4px">${esc(p.why)}</p>` : ""}${examples(p)}</div>`).join("")}
+    ${k.phrases.length ? `<h3 style="margin-top:14px">Phrases to reuse</h3><ul>${k.phrases.map((ph) => `<li class="small"><strong>${esc(ph.phrase)}</strong>${ph.use ? ` <span class="muted">${esc(ph.use)}</span>` : ""}</li>`).join("")}</ul>` : ""}
+    ${k.focus_next ? `<div class="card due"><div class="tag">Next time, one thing</div><p style="margin:4px 0 0">${esc(k.focus_next)}</p></div>` : ""}
+    <p class="small muted">From ${esc(c.provider)} (${esc(c.model)}). A language model reads the transcript, so it can be wrong or miss things the audio would show${c.provider === "mock" ? ". This one is a placeholder." : "."}</p>`;
+}
+
+async function setupCoach(root, detail) {
+  const box = $("#coach", root);
+  if (!box) return;
+  box.innerHTML = `<h3>Feedback</h3>`;
+  const body = document.createElement("div");
+  box.appendChild(body);
+  if (!STATE || !STATE.llm) { try { await refreshState(); } catch (_) {} }
+  const llm = (STATE && STATE.llm) || {};
+  let existing = null;
+  try { existing = (await api(`/api/sessions/${detail.id}/coach`, {})).coaching; } catch (_) {}
+  const request = async (regenerate) => {
+    body.innerHTML = `<p class="muted small">Analysing the transcript…</p>`;
+    try {
+      const r = await api(`/api/sessions/${detail.id}/coach${regenerate ? "?regenerate=true" : ""}`, { method: "POST" });
+      logEvent("coach_shown", { regenerate }, detail.id);
+      show_(r.coaching);
+    } catch (e) {
+      body.innerHTML = `<p class="err small">Could not get feedback: ${esc(e.message)}</p><button class="secondary" id="coach-retry">Try again</button>`;
+      $("#coach-retry", body).addEventListener("click", () => request(regenerate));
+    }
+  };
+  const show_ = (c) => {
+    renderCoaching(body, c);
+    if (llm.configured) {
+      const b = document.createElement("button");
+      b.className = "secondary"; b.textContent = "Ask again (uses credits)"; b.style.marginTop = "8px";
+      b.addEventListener("click", () => request(true));
+      body.appendChild(b);
+    }
+  };
+  if (existing) { show_(existing); return; }
+  if (!llm.configured) { body.innerHTML = `<p class="muted small">${esc(llm.error || "Feedback is not configured.")}</p>`; return; }
+  if (detail.status !== "done") return;
+  body.innerHTML = `<p class="muted small">A language model reads your transcript and points out a few patterns worth fixing, plus phrases to reuse. It costs a small amount of your credits each time.</p><button class="primary" id="coach-go">Get feedback</button>`;
+  $("#coach-go", body).addEventListener("click", () => request(false));
 }
 
 // ---------------------------------------------------------------- history

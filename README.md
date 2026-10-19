@@ -9,6 +9,7 @@ A personal tool to measure and improve spoken English fluency. This first versio
 - Metrics per session: words per minute, articulation rate, phonation ratio, mean length of run, pauses of 250 ms or more (total, mid-clause, clause-boundary, over 1 second), fillers, repetitions, time to first word.
 - A progress table that tells you whether a change is larger than your own noise.
 - A 4/3/2 drill: the same story told in 4, then 3, then 2 minutes. Each round is recorded and transcribed like a test, and a table compares the rounds (speed, pauses, mid-clause pauses, fillers, repetitions). Drills are kept out of the checkpoint comparison, because retelling a story is partly rehearsal.
+- Feedback after a session (optional, needs a language model): a few patterns worth fixing with your own quotes and a better version, phrases to reuse, and one thing to focus on next time. Every quote is checked against the transcript and flagged if the model invented it.
 - A transcript view with every pause marked, plus audio playback.
 - A detailed export (Data tab, or `/api/export?detail=true`) with every word and its timing, every pause and the quality flags.
 - A detailed export (Data tab, or `/api/export?detail=true`) with every word and its timing, every pause and the quality flags.
@@ -23,6 +24,18 @@ python -m app
 ```
 
 Open http://127.0.0.1:8765 in Chrome or Firefox and allow the microphone. To try the app without any key, set `STT_PROVIDER=mock` in `.env`. Mock transcripts are invented and are excluded from the progress view.
+
+## Feedback with a language model
+
+Put these in `.env`, then restart:
+
+```
+LLM_PROVIDER=openrouter      # or anthropic
+LLM_API_KEY=your key
+LLM_MODEL=exact model name from your provider
+```
+
+`LLM_PROVIDER=mock` shows the screen with placeholder text, with no key and no cost. The feedback button appears in each session; it is never called automatically. Results are stored, so reopening a session costs nothing. `COACH_MAX_PER_DAY` (default 30) caps the requests per 24 hours. The transcript of the session is sent to the provider you choose; the audio is not. Token usage is written to the event log. Both adapters follow the providers' public API shape and are covered by tests with a fake server, but I have not run them against the live services.
 
 ## Tracking and safety
 

@@ -55,6 +55,18 @@ CREATE TABLE IF NOT EXISTS ratings (
     comment TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS coaching (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    content TEXT NOT NULL,
+    usage TEXT,
+    raw TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_coaching_session ON coaching(session_id);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -166,6 +178,36 @@ class DB:
         with self.conn() as c:
             return [dict(r) for r in c.execute("SELECT * FROM ratings WHERE session_id = ? ORDER BY id", (sid,))]
 
+    # coaching -------------------------------------------------------------
+    def add_coaching(self, sid: str, version: str, provider: str, model: str, content: dict[str, Any],
+                     usage: dict[str, Any], raw: str) -> int:
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT INTO coaching (session_id, version, created_at, provider, model, content, usage, raw) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (sid, version, utcnow(), provider, model, json.dumps(content, ensure_ascii=False),
+                 json.dumps(usage, ensure_ascii=False), raw),
+            )
+            return int(cur.lastrowid)
+
+    def latest_coaching(self, sid: str, version: str | None = None) -> dict[str, Any] | None:
+        q, args = "SELECT * FROM coaching WHERE session_id = ?", [sid]
+        if version:
+            q += " AND version = ?"; args.append(version)
+        with self.conn() as c:
+            r = c.execute(q + " ORDER BY id DESC LIMIT 1", args).fetchone()
+        if not r:
+            return None
+        out = dict(r)
+        out["content"] = json.loads(out["content"])
+        out["usage"] = json.loads(out["usage"]) if out.get("usage") else {}
+        out.pop("raw", None)
+        return out
+
+    def count_coaching_since(self, iso_prefix: str) -> int:
+        with self.conn() as c:
+            return int(c.execute("SELECT COUNT(*) FROM coaching WHERE created_at >= ?", (iso_prefix,)).fetchone()[0])
+
     # settings -------------------------------------------------------------
     def get_setting(self, key: str) -> str | None:
         with self.conn() as c:
@@ -181,7 +223,7 @@ class DB:
         with self.conn() as c:
             out = {
                 t: [dict(r) for r in c.execute(f"SELECT * FROM {t}").fetchall()]
-                for t in ("sessions", "metrics", "ratings", "settings")
+                for t in ("sessions", "metrics", "ratings", "settings", "coaching")
             }
         for s in out["sessions"]:
             if s.get("client_info"):

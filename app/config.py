@@ -28,6 +28,11 @@ class Settings:
     max_upload_bytes: int
     host: str
     port: int
+    llm_provider: str = "none"
+    llm_key: str = ""
+    llm_model: str = ""
+    llm_base_url: str = ""
+    coach_max_per_day: int = 30
 
 
 def load_settings() -> Settings:
@@ -46,4 +51,9 @@ def load_settings() -> Settings:
         max_upload_bytes=int(os.environ.get("MAX_UPLOAD_MB", "100")) * 1024 * 1024,
         host=os.environ.get("HOST", "127.0.0.1"),
         port=int(os.environ.get("PORT", "8765")),
+        llm_provider=os.environ.get("LLM_PROVIDER", "none").strip().lower(),
+        llm_key=os.environ.get("LLM_API_KEY", "").strip(),
+        llm_model=os.environ.get("LLM_MODEL", "").strip(),
+        llm_base_url=os.environ.get("LLM_BASE_URL", "").strip(),
+        coach_max_per_day=int(os.environ.get("COACH_MAX_PER_DAY", "30")),
     )
