@@ -217,12 +217,20 @@ async function runSession(params) {
   const t0 = performance.now();
   recorder.start(1000);
   logEvent("record_started", { mime: recorder.mimeType, planned }, sid);
-  stage.innerHTML = `<p><span class="rec-dot"></span>Recording. Keep going until the timer ends.</p><div class="clock" id="clock">${mmss(0)}</div><button class="secondary" id="stop">Stop early</button>`;
+  stage.innerHTML = `<p><span class="rec-dot"></span>Recording. Keep going until the timer ends.</p><div class="clock" id="clock">${mmss(0)}</div><p class="wrapup" id="wrapup" hidden>20 seconds left. Finish your thought and conclude.</p><button class="secondary" id="stop">Stop early</button>`;
   let stopped = false;
+  let cueShown = false;
   $("#stop", stage).addEventListener("click", () => { stopped = true; });
   while (!stopped && !cancelled && (performance.now() - t0) / 1000 < planned) {
     await sleep(250);
-    const c = $("#clock", stage); if (c) c.textContent = mmss((performance.now() - t0) / 1000);
+    const elapsed = (performance.now() - t0) / 1000;
+    const c = $("#clock", stage); if (c) c.textContent = mmss(elapsed);
+    if (!cueShown && planned > 40 && planned - elapsed <= 20) {
+      // visual cue only: the recording length is unchanged, so measurements stay comparable
+      cueShown = true;
+      const w = $("#wrapup", stage); if (w) w.hidden = false;
+      logEvent("wrap_up_cue", { elapsed_s: Number(elapsed.toFixed(1)) }, sid);
+    }
   }
   if (cancelled) return;
   const durationS = (performance.now() - t0) / 1000;

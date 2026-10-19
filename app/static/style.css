@@ -93,3 +93,5 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .muted { color: var(--muted); }
 .err { color: var(--bad); }
 .small { font-size: 13px; }
+.wrapup { background: var(--warn-bg); color: var(--warn-text); padding: 8px 12px; border-radius: 8px; font-weight: 600; margin: 10px 0; }
+.wrapup[hidden] { display: none; }
