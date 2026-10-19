@@ -66,7 +66,7 @@ Limits to keep in mind: the model sees only the transcript, so on a short or unc
 
 ## Look
 
-Playful, colourful interface: cream paper with a dot grid, thick outlines, chunky buttons, a colour per tab, and a light or dark switch (top right, remembered in the browser). The Outfit font is bundled in `app/static/fonts` (SIL Open Font License, text included), so nothing is loaded from the internet. Decorative shapes and speech bubbles appear in the margins on wide screens only.
+Playful, colourful interface: cream paper with a dot grid, thick outlines, chunky buttons, a colour per tab, and a light or dark switch (top right, remembered in the browser). The Outfit font is bundled in `app/static/fonts` (SIL Open Font License, text included), so nothing is loaded from the internet. Decorative shapes and speech bubbles appear in the margins on wide screens only. Small animations (floating shapes, cards that pop in, confetti when a session or a review ends) are switched off when your device asks for reduced motion, and nothing moves during a recording.
 
 ## Tests
 

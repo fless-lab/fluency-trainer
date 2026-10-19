@@ -36,6 +36,19 @@ window.addEventListener("unhandledrejection", (e) => logEvent("js_rejection", { 
 
 const fmt = (v, d = 1) => (v === null || v === undefined || Number.isNaN(v) ? "n/a" : Number(v).toFixed(d));
 const mmss = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+function confetti(n = 36) {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const colors = ["#fcd84a", "#f472b6", "#6ee7b7", "#5cc8f0", "#ff7b5c", "#7c3aed"];
+  const box = document.createElement("div");
+  box.className = "confetti";
+  for (let i = 0; i < n; i++) {
+    const p = document.createElement("i");
+    p.style.cssText = `left:${Math.random() * 100}%;background:${colors[i % colors.length]};--dx:${Math.round(Math.random() * 160 - 80)}px;--rot:${Math.round(Math.random() * 720 - 360)}deg;animation-delay:${Math.round(Math.random() * 300)}ms;animation-duration:${1400 + Math.round(Math.random() * 900)}ms;${i % 3 === 0 ? "border-radius:50%;" : ""}`;
+    box.appendChild(p);
+  }
+  document.body.appendChild(box);
+  setTimeout(() => box.remove(), 2800);
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const METRIC_ORDER = [
@@ -336,6 +349,7 @@ async function showDrillSummary(gid) {
   const failed = g.rounds.filter((r) => r.status === "error");
   stage.innerHTML = `<h2>4/3/2 result</h2><p class="muted small">${esc(g.topic_text)}</p>${failed.length ? `<div class="banner" style="margin:10px 0;border-radius:8px">${failed.length} round(s) could not be transcribed. The audio is kept: open it in History and retry.</div>` : ""}${drillTable(g)}<p class="muted small">${esc(DRILL_NOTE)}</p><button class="primary" id="done">Done</button>`;
   $("#done", stage).addEventListener("click", finish);
+  if (!failed.length) confetti();
 }
 
 // ---------------------------------------------------------------- result / session detail
@@ -361,6 +375,7 @@ async function showResult(box, sid) {
   closeBtn.className = "primary"; closeBtn.textContent = "Done"; closeBtn.style.marginTop = "18px";
   closeBtn.addEventListener("click", () => { closeOverlay(); show("today"); });
   stage.appendChild(closeBtn);
+  confetti();
 }
 
 function renderTranscript(detail) {
@@ -492,7 +507,7 @@ async function renderNotebook() {
   else {
     let i = 0;
     const next = () => {
-      if (i >= reviewable.length) { dueBox.innerHTML = `<div class="card"><strong>Review done.</strong></div>`; return; }
+      if (i >= reviewable.length) { dueBox.innerHTML = `<div class="card"><strong>Review done.</strong> Nice work.</div>`; confetti(); return; }
       const it = reviewable[i];
       dueBox.innerHTML = `<div class="card due"><div class="row spread"><div class="tag">Review ${i + 1} of ${reviewable.length}</div></div>
         <p class="small muted" style="margin:6px 0 0">Say this out loud in English, in a full sentence if you can:</p>
