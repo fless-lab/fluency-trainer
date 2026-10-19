@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     attempts INTEGER NOT NULL DEFAULT 0,
     self_rating INTEGER,
     notes TEXT,
-    client_info TEXT
+    client_info TEXT,
+    group_id TEXT,
+    drill_round INTEGER
 );
 CREATE TABLE IF NOT EXISTS metrics (
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -75,6 +77,12 @@ class DB:
         self._lock = threading.RLock()
         with self.conn() as c:
             c.executescript(SCHEMA)
+            # databases created by earlier versions lack the drill columns: add them in place
+            have = {r["name"] for r in c.execute("PRAGMA table_info(sessions)").fetchall()}
+            for name, ddl in (("group_id", "TEXT"), ("drill_round", "INTEGER")):
+                if name not in have:
+                    c.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_group ON sessions(group_id)")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:

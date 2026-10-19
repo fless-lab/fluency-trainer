@@ -192,3 +192,68 @@ def test_event_log_download_is_a_consistent_snapshot(client):
 def test_page_and_scripts_are_always_revalidated(client):
     for path in ("/", "/static/app.js", "/static/style.css"):
         assert client.get(path).headers["cache-control"] == "no-cache"
+
+
+GID = "a" * 32
+
+
+def record_drill(client, round_, gid=GID, topic="Tell me a story.", seconds=100.0):
+    body = {"kind": "drill", "group_id": gid, "drill_round": round_}
+    if round_ == 1:
+        body["topic_text"] = topic
+    r = client.post("/api/sessions", json=body)
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+    up = client.post(f"/api/sessions/{sid}/audio", files={"file": ("a.webm", b"x", "audio/webm")},
+                     data={"duration_s": str(seconds), "mime": "audio/webm"})
+    assert up.status_code == 200, up.text
+    return r.json()
+
+
+def test_drill_rounds_follow_the_432_timings_and_keep_the_same_topic(client):
+    r1 = record_drill(client, 1)
+    r2 = record_drill(client, 2, seconds=90.0)
+    r3 = record_drill(client, 3, seconds=60.0)
+    assert (r1["planned_seconds"], r2["planned_seconds"], r3["planned_seconds"]) == (240, 180, 120)
+    assert (r1["prep_seconds"], r2["prep_seconds"], r3["prep_seconds"]) == (30, 10, 10)
+    assert r2["topic_text"] == r3["topic_text"] == "Tell me a story."
+    d = client.get(f"/api/drills/{GID}").json()
+    assert [r["round"] for r in d["rounds"]] == [1, 2, 3] and d["complete"] is True
+    assert d["change"]["words_per_minute"]["from_round"] == 1 and d["change"]["words_per_minute"]["to_round"] == 3
+    assert client.get("/api/drills").json() == []  # mock transcripts stay out of the default list
+    assert len(client.get("/api/drills", params={"include_mock": True}).json()) == 1
+
+
+def test_drill_rejects_out_of_order_and_incomplete_requests(client):
+    assert client.post("/api/sessions", json={"kind": "drill"}).status_code == 422
+    assert client.post("/api/sessions", json={"kind": "drill", "group_id": GID, "drill_round": 1}).status_code == 422
+    assert client.post("/api/sessions", json={"kind": "drill", "group_id": GID, "drill_round": 2}).status_code == 409
+    assert client.post("/api/sessions", json={"kind": "drill", "group_id": "nope", "drill_round": 1, "topic_text": "x"}).status_code == 422
+    record_drill(client, 1)
+    assert client.post("/api/sessions", json={"kind": "drill", "group_id": GID, "drill_round": 1, "topic_text": "x"}).status_code == 409
+    assert client.post("/api/sessions", json={"kind": "drill", "group_id": GID, "drill_round": 3}).status_code == 409
+    assert client.get("/api/drills/" + "b" * 32).status_code == 404
+
+
+def test_drill_sessions_never_enter_the_checkpoint_progress(client):
+    for n in (1, 2, 3):
+        record_drill(client, n)
+    p = client.get("/api/progress", params={"include_mock": True}).json()
+    assert all(cp["n_topics"] == 0 for cp in p["checkpoints"].values())
+
+
+def test_database_from_an_older_version_is_upgraded_in_place(tmp_path):
+    import sqlite3
+    from app.db import DB
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, local_date TEXT NOT NULL, kind TEXT NOT NULL, "
+                "checkpoint TEXT, topic_id TEXT, topic_text TEXT, is_repeat INTEGER NOT NULL DEFAULT 0, planned_seconds INTEGER, "
+                "prep_seconds INTEGER, audio_path TEXT, audio_mime TEXT, audio_bytes INTEGER, client_seconds REAL, audio_seconds REAL, "
+                "status TEXT NOT NULL, provider TEXT, provider_job_id TEXT, transcript_path TEXT, transcript_text TEXT, error TEXT, "
+                "attempts INTEGER NOT NULL DEFAULT 0, self_rating INTEGER, notes TEXT, client_info TEXT)")
+    con.execute("INSERT INTO sessions (id, created_at, local_date, kind, status) VALUES ('old1', 't', 'd', 'free', 'done')")
+    con.commit(); con.close()
+    db = DB(path)
+    s = db.get_session("old1")
+    assert s["id"] == "old1" and s["group_id"] is None and s["drill_round"] is None

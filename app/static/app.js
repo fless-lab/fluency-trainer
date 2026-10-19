@@ -150,7 +150,14 @@ async function renderToday() {
     html += `</div>`;
   }
   html += `<div class="card"><h3>Free monologue</h3><p class="muted small">Talk about anything. Logged and measured like the tests, but kept out of the checkpoint comparison.</p><div class="row"><input type="text" id="free-topic" placeholder="Topic (optional)" size="40"><select id="free-length"><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option></select><button class="primary" id="free-start">Start</button></div></div>`;
+  html += `<div class="card"><h3>4/3/2 drill</h3><p class="muted small">Tell the same story three times, in 4, then 3, then 2 minutes. Same content each time, nothing new added. The shrinking time pushes you to find your words faster. About 10 minutes in all. This is training, not a test: it is kept out of the checkpoint comparison.</p><div class="row"><select id="drill-topic">${(STATE.drill_topics || []).map((t) => `<option value="${esc(t.text)}">${esc(t.text)}</option>`).join("")}<option value="">My own topic…</option></select></div><div class="row" style="margin-top:8px"><input type="text" id="drill-custom" placeholder="Your topic" size="50" hidden><button class="primary" id="drill-start">Start</button></div></div>`;
   view.innerHTML = html;
+  $("#drill-topic").addEventListener("change", (e) => { const c = $("#drill-custom"); c.hidden = e.target.value !== ""; if (!c.hidden) c.focus(); });
+  $("#drill-start").addEventListener("click", () => {
+    const chosen = $("#drill-topic").value || $("#drill-custom").value.trim();
+    if (!chosen) { alert("Write your topic first."); return; }
+    runDrill(chosen);
+  });
   view.querySelectorAll("button[data-cp]").forEach((b) => b.addEventListener("click", () => runSession({ kind: "baseline", checkpoint: b.dataset.cp, topic_id: b.dataset.topic })));
   $("#free-start").addEventListener("click", () => runSession({ kind: "free", topic_text: $("#free-topic").value.trim() || null, planned_seconds: Number($("#free-length").value) }));
   const rp = $("#retry-pending"); if (rp) rp.addEventListener("click", async () => { rp.disabled = true; await retryPending(); show("today"); });
@@ -166,14 +173,14 @@ function pickMime() {
 function closeOverlay() { overlay.hidden = true; overlay.innerHTML = ""; document.body.style.overflow = ""; }
 function openOverlay(html) { overlay.hidden = false; document.body.style.overflow = "hidden"; overlay.innerHTML = `<div class="inner">${html}</div>`; return overlay.firstElementChild; }
 
-async function runSession(params) {
+async function runSession(params, opts = {}) {
   let session;
   try {
     session = await api("/api/sessions", { method: "POST", body: { ...params, client_info: { ua: navigator.userAgent, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, screen: `${screen.width}x${screen.height}` } } });
   } catch (e) { alert(`Could not create the session: ${e.message}`); return; }
   const sid = session.id;
   logEvent("session_screen_opened", { kind: params.kind }, sid);
-  const box = openOverlay(`<button class="secondary" id="cancel">Cancel</button><p class="tag" style="margin-top:24px">${params.kind === "baseline" ? "Test" : "Free monologue"}</p><div class="big-topic">${esc(session.topic_text || "Talk about anything you like.")}</div><div id="stage"></div>`);
+  const box = openOverlay(`<button class="secondary" id="cancel">Cancel</button><p class="tag" style="margin-top:24px">${esc(opts.label || (params.kind === "baseline" ? "Test" : "Free monologue"))}</p><div class="big-topic">${esc(session.topic_text || "Talk about anything you like.")}</div>${opts.hint ? `<p class="muted">${esc(opts.hint)}</p>` : ""}<div id="stage"></div>`);
   const stage = $("#stage", box);
   let cancelled = false, recorder = null, stream = null;
   $("#cancel", box).addEventListener("click", () => {
@@ -200,7 +207,7 @@ async function runSession(params) {
   if (session.prep_seconds > 0) {
     logEvent("prep_started", { seconds: session.prep_seconds }, sid);
     let left = session.prep_seconds, ready = false;
-    stage.innerHTML = `<p class="muted">Preparation. Think, do not write.</p><div class="clock" id="clock">${mmss(left)}</div><button class="primary" id="ready">I'm ready</button>`;
+    stage.innerHTML = `<p class="muted">${esc(opts.prepText || "Preparation. Think, do not write.")}</p><div class="clock" id="clock">${mmss(left)}</div><button class="primary" id="ready">I'm ready</button>`;
     $("#ready", stage).addEventListener("click", () => { ready = true; });
     while (left > 0 && !ready && !cancelled) { await sleep(1000); left -= 1; const c = $("#clock", stage); if (c) c.textContent = mmss(Math.max(left, 0)); }
     if (cancelled) return;
@@ -252,9 +259,80 @@ async function runSession(params) {
   if (!uploaded) {
     stage.innerHTML = `<p class="err">The upload failed. ${kept ? "Your recording is saved on this device and will be uploaded next time you open the app." : "Download it now so it is not lost."}</p><div class="row"><button class="primary" id="again">Try again</button><a class="secondary" id="dl" href="${URL.createObjectURL(blob)}" download="recording-${sid}.webm">Download recording</a></div>`;
     $("#again", stage).addEventListener("click", async () => { try { await uploadAudio(item); await pendingDelete(sid); showResult(box, sid); } catch (e) { alert(e.message); } });
-    return;
+    return null;
   }
+  if (opts.drill) return sid; // a drill moves straight on to its next round; transcription runs in the background
   showResult(box, sid);
+  return sid;
+}
+
+// ---------------------------------------------------------------- 4/3/2 drill
+function newGroupId() {
+  const b = new Uint8Array(16); crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+async function runDrill(topicText) {
+  const gid = newGroupId();
+  const secs = STATE.drill_seconds || [240, 180, 120];
+  logEvent("drill_started", { group_id: gid }, null);
+  for (let round = 1; round <= 3; round++) {
+    const mins = minutes(secs[round - 1]);
+    const sid = await runSession(
+      { kind: "drill", group_id: gid, drill_round: round, topic_text: round === 1 ? topicText : undefined },
+      {
+        drill: true,
+        label: `4/3/2 · round ${round} of 3 · ${mins} minutes`,
+        hint: round === 1 ? "Tell the story in full. You will tell it again, shorter, twice." : `Tell the same story again in ${mins} minutes. Same content, tighter and faster. Do not add new material.`,
+        prepText: round === 1 ? "Preparation. Think, do not write." : "Short breath. Same story, less time.",
+      });
+    if (!sid) { logEvent("drill_stopped", { group_id: gid, at_round: round }, null); return; }
+  }
+  logEvent("drill_recorded", { group_id: gid }, null);
+  await showDrillSummary(gid);
+}
+
+const minutes = (sec) => Number((sec / 60).toFixed(1));
+const DRILL_ROWS = [
+  ["words_per_minute", "Words per minute", 0],
+  ["mean_length_of_run_words", "Words between pauses", 1],
+  ["pauses_per_100_words", "Pauses per 100 words", 1],
+  ["mid_clause_pauses_per_100_words", "Mid-clause pauses per 100 words", 1],
+  ["mean_pause_ms", "Mean pause (ms)", 0],
+  ["fillers_per_100_words", "Fillers per 100 words", 1],
+  ["repetitions_per_100_words", "Repetitions per 100 words", 1],
+  ["content_words", "Words (without fillers)", 0],
+];
+
+function changeCell(c) {
+  if (!c) return '<span class="v-none">n/a</span>';
+  const good = c.better === "info" ? null : (c.delta > 0) === (c.better === "higher");
+  const cls = c.better === "info" || Math.abs(c.delta) < 1e-9 ? "v-none" : good ? "v-improved" : "v-worse";
+  return `<span class="${cls}">${c.delta > 0 ? "+" : ""}${fmt(c.delta, 1)}</span>`;
+}
+
+function drillTable(g) {
+  const cols = g.rounds.map((r) => `<th class="num">Round ${r.round}<div class="tag">${minutes(r.planned_seconds)} min</div></th>`).join("");
+  const rows = DRILL_ROWS.map(([k, label, d]) => `<tr><td>${esc(label)}</td>${g.rounds.map((r) => `<td class="num">${r.status === "done" ? fmt(r.metrics[k], d) : esc(r.status)}</td>`).join("")}<td class="num">${changeCell(g.change[k])}</td></tr>`).join("");
+  return `<div class="card scroll"><table><thead><tr><th></th>${cols}<th class="num">Change</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+const DRILL_NOTE = "Telling the same story again is easier each time, so some of the gain is rehearsal. What matters is the shape of it: fewer mid-clause pauses and restarts at the same or higher speed. This is not a measure of progress on new topics; the checkpoint tests are for that.";
+
+async function showDrillSummary(gid) {
+  const box = openOverlay(`<p class="tag">4/3/2 · result</p><div id="stage"><p class="muted">Transcribing the three rounds… this takes a few minutes.</p></div>`);
+  const stage = $("#stage", box);
+  const finish = () => { closeOverlay(); show("today"); };
+  let g = null;
+  for (let i = 0; i < 300; i++) {
+    g = await api(`/api/drills/${gid}`, {}).catch(() => null);
+    if (g && g.rounds.length === 3 && g.rounds.every((r) => r.status === "done" || r.status === "error")) break;
+    await sleep(3000);
+  }
+  if (!g) { stage.innerHTML = `<p class="err">Lost contact with the server. Your recordings are safe. Open History later.</p><button class="primary" id="done">Close</button>`; $("#done", stage).addEventListener("click", finish); return; }
+  const failed = g.rounds.filter((r) => r.status === "error");
+  stage.innerHTML = `<h2>4/3/2 result</h2><p class="muted small">${esc(g.topic_text)}</p>${failed.length ? `<div class="banner" style="margin:10px 0;border-radius:8px">${failed.length} round(s) could not be transcribed. The audio is kept: open it in History and retry.</div>` : ""}${drillTable(g)}<p class="muted small">${esc(DRILL_NOTE)}</p><button class="primary" id="done">Done</button>`;
+  $("#done", stage).addEventListener("click", finish);
 }
 
 // ---------------------------------------------------------------- result / session detail
@@ -328,7 +406,7 @@ function renderSessionDetail(container, detail) {
 async function renderHistory() {
   const sessions = await api("/api/sessions");
   if (!sessions.length) { view.innerHTML = `<h2>History</h2><p class="lead">No sessions yet.</p>`; return; }
-  const rows = sessions.map((s) => `<tr data-id="${esc(s.id)}" style="cursor:pointer"><td>${esc(s.created_at.slice(0, 16).replace("T", " "))}</td><td>${esc(s.checkpoint || "free")}</td><td>${esc((s.topic_text || "").slice(0, 60))}</td><td><span class="status ${esc(s.status)}">${esc(s.status)}</span>${s.provider === "mock" ? ' <span class="muted small">mock</span>' : ""}</td><td class="num">${fmt(s.metrics.words_per_minute, 0)}</td><td class="num">${fmt(s.metrics.mid_clause_pauses_per_100_words, 1)}</td></tr>`).join("");
+  const rows = sessions.map((s) => `<tr data-id="${esc(s.id)}" style="cursor:pointer"><td>${esc(s.created_at.slice(0, 16).replace("T", " "))}</td><td>${esc(s.checkpoint || (s.kind === "drill" ? `4/3/2 · round ${s.drill_round}` : "free"))}</td><td>${esc((s.topic_text || "").slice(0, 60))}</td><td><span class="status ${esc(s.status)}">${esc(s.status)}</span>${s.provider === "mock" ? ' <span class="muted small">mock</span>' : ""}</td><td class="num">${fmt(s.metrics.words_per_minute, 0)}</td><td class="num">${fmt(s.metrics.mid_clause_pauses_per_100_words, 1)}</td></tr>`).join("");
   view.innerHTML = `<h2>History</h2><p class="lead">Click a session to review it.</p><div class="card scroll"><table><thead><tr><th>When (UTC)</th><th>Checkpoint</th><th>Topic</th><th>Status</th><th>WPM</th><th>Mid-clause pauses /100</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   view.querySelectorAll("tr[data-id]").forEach((tr) => tr.addEventListener("click", () => openSession(tr.dataset.id)));
 }
@@ -364,6 +442,8 @@ function verdictCell(v) {
 async function renderProgress() {
   const mock = new URLSearchParams(location.search).has("mock");
   const p = await api(`/api/progress${mock ? "?include_mock=true" : ""}`);
+  const drills = await api(`/api/drills${mock ? "?include_mock=true" : ""}`);
+  const drillHtml = drills.length ? `<h3>4/3/2 drills</h3><p class="muted small">${esc(DRILL_NOTE)}</p>${drills.map((g) => `<p class="small" style="margin-bottom:4px"><strong>${esc(g.local_date)}</strong> · ${esc(g.topic_text)}</p>${drillTable(g)}`).join("")}` : "";
   const cps = p.checkpoints;
   const rows = Object.entries(p.metrics).map(([k, m]) => `<tr><td>${esc(m.label)}<div class="tag">${m.better === "info" ? "context" : `better: ${m.better}`}</div></td>
     <td class="num">${fmt(cps.base0.means[k], 2)}</td><td class="num">${fmt(cps.base2.means[k], 2)}</td><td class="num">${fmt(p.noise[k], 2)}</td>
@@ -373,7 +453,7 @@ async function renderProgress() {
   view.innerHTML = `<h2>Progress</h2><p class="lead">Averages over three topics per checkpoint. A change only counts when it is larger than the noise column (the gap between your day 0 and day 2 baselines).</p>
     <div class="card scroll"><table><thead><tr><th>Metric</th><th>Day 0</th><th>Day 2</th><th>Noise</th><th>Day 15</th><th>Change vs baseline</th><th>Day 30</th><th>Change vs baseline</th></tr></thead><tbody>${rows}</tbody></table></div>
     <p class="small muted">Topics recorded: day 0 ${cps.base0.n_topics}/${cps.base0.topics_expected}, day 2 ${cps.base2.n_topics}/${cps.base2.topics_expected}, day 15 ${cps.day15.n_topics}/${cps.day15.topics_expected}, day 30 ${cps.day30.n_topics}/${cps.day30.topics_expected}.${mock ? " Mock sessions included." : ""}</p>
-    ${repeats}<h3>How to read this</h3><ul>${p.notes.map((n) => `<li class="small">${esc(n)}</li>`).join("")}</ul>`;
+    ${repeats}${drillHtml}<h3>How to read this</h3><ul>${p.notes.map((n) => `<li class="small">${esc(n)}</li>`).join("")}</ul>`;
 }
 
 // ---------------------------------------------------------------- data

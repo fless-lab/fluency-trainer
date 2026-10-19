@@ -8,6 +8,7 @@ A personal tool to measure and improve spoken English fluency. This first versio
 - Free monologues, measured the same way but kept out of the checkpoint comparison.
 - Metrics per session: words per minute, articulation rate, phonation ratio, mean length of run, pauses of 250 ms or more (total, mid-clause, clause-boundary, over 1 second), fillers, repetitions, time to first word.
 - A progress table that tells you whether a change is larger than your own noise.
+- A 4/3/2 drill: the same story told in 4, then 3, then 2 minutes. Each round is recorded and transcribed like a test, and a table compares the rounds (speed, pauses, mid-clause pauses, fillers, repetitions). Drills are kept out of the checkpoint comparison, because retelling a story is partly rehearsal.
 - A transcript view with every pause marked, plus audio playback.
 - A detailed export (Data tab, or `/api/export?detail=true`) with every word and its timing, every pause and the quality flags.
 - A detailed export (Data tab, or `/api/export?detail=true`) with every word and its timing, every pause and the quality flags.
@@ -50,4 +51,4 @@ python -m pytest -q
 
 ## Next
 
-Conversation partner with patient turn-taking, the 4/3/2 mode, delayed feedback, and a memory of your recurring errors.
+Conversation partner with patient turn-taking, delayed feedback, and a memory of your recurring errors.

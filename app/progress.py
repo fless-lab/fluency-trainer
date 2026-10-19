@@ -135,3 +135,60 @@ def build_progress(
             "Clause-boundary versus mid-clause classification and syllable counts are heuristics.",
         ],
     }
+
+
+DRILL_METRICS = (
+    "words_per_minute", "phonation_ratio", "mean_length_of_run_words", "pauses_per_100_words",
+    "mid_clause_pauses_per_100_words", "mean_pause_ms", "fillers_per_100_words",
+    "repetitions_per_100_words", "content_words",
+)
+DRILL_DIRECTION = {**{k: v[1] for k, v in METRIC_INFO.items()}, "mean_pause_ms": "lower", "content_words": "info"}
+
+
+def build_drills(
+    sessions: list[dict[str, Any]],
+    metrics: dict[str, dict[str, float]],
+    include_mock: bool = False,
+) -> list[dict[str, Any]]:
+    """Group the rounds of each 4/3/2 drill and compare the last finished round with the first.
+
+    The rounds are the same content told again, so a gain from round 1 to round 3 is
+    expected and partly rehearsal. It shows what tighter delivery looks like for you;
+    it is not by itself a measure of progress in spontaneous speech.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for s in sessions:
+        if s.get("kind") == "drill" and s.get("group_id"):
+            if include_mock or s["provider"] != "mock":
+                groups.setdefault(s["group_id"], []).append(s)
+    out = []
+    for gid, rows in groups.items():
+        latest: dict[int, dict[str, Any]] = {}
+        for r in sorted(rows, key=lambda x: x["created_at"]):
+            latest[r["drill_round"]] = r
+        rounds = []
+        for n in sorted(latest):
+            r = latest[n]
+            m = metrics.get(r["id"], {}) if r["status"] == "done" else {}
+            rounds.append({
+                "round": n, "session_id": r["id"], "status": r["status"], "planned_seconds": r["planned_seconds"],
+                "client_seconds": r["client_seconds"], "error": r["error"],
+                "metrics": {k: m.get(k) for k in DRILL_METRICS},
+            })
+        have = [r for r in rounds if r["status"] == "done" and r["metrics"].get("words_per_minute") is not None]
+        change: dict[str, Any] = {}
+        if len(have) >= 2:
+            first, last = have[0], have[-1]
+            for k in DRILL_METRICS:
+                a, b = first["metrics"].get(k), last["metrics"].get(k)
+                change[k] = None if a is None or b is None else {
+                    "from_round": first["round"], "to_round": last["round"], "first": a, "last": b,
+                    "delta": round(b - a, 3), "better": DRILL_DIRECTION.get(k, "info"),
+                }
+        first_row = min(rows, key=lambda x: x["created_at"])
+        out.append({
+            "group_id": gid, "topic_text": first_row["topic_text"], "created_at": first_row["created_at"],
+            "local_date": first_row["local_date"], "complete": len(have) == 3, "rounds": rounds, "change": change,
+        })
+    out.sort(key=lambda g: g["created_at"], reverse=True)
+    return out

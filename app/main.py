@@ -21,8 +21,9 @@ from .config import Settings, load_settings
 from .db import DB
 from .eventlog import EventLog, utcnow
 from .metrics import METRICS_VERSION, compute_metrics
-from .progress import build_progress
-from .protocols import CHECKPOINT_BY_ID, CHECKPOINTS, PREP_SECONDS, SPEAK_SECONDS, topics_for_checkpoint
+from .progress import build_drills, build_progress
+from .protocols import (CHECKPOINT_BY_ID, CHECKPOINTS, DRILL_PREP_SECONDS, DRILL_SECONDS, DRILL_TOPICS, PREP_SECONDS,
+                        SPEAK_SECONDS, topics_for_checkpoint)
 from .providers.assemblyai import AssemblyAISTT
 from .providers.base import STTProvider
 from .providers.mock import MockSTT
@@ -41,7 +42,9 @@ ALLOWED_MIME = {
 
 
 class NewSession(BaseModel):
-    kind: Literal["baseline", "free"]
+    kind: Literal["baseline", "free", "drill"]
+    group_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    drill_round: int | None = Field(default=None, ge=1, le=3)
     checkpoint: str | None = None
     topic_id: str | None = None
     topic_text: str | None = Field(default=None, max_length=500)
@@ -222,6 +225,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "prep_seconds": PREP_SECONDS,
             "speak_seconds": SPEAK_SECONDS,
             "checkpoints": cps,
+            "drill_topics": DRILL_TOPICS,
+            "drill_seconds": list(DRILL_SECONDS),
         }
 
     @app.post("/api/start")
@@ -245,6 +250,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             t = topics[body.topic_id]
             topic_text, is_repeat, checkpoint = t["text"], t["is_repeat"], body.checkpoint
             planned, prep = SPEAK_SECONDS, PREP_SECONDS
+        group_id = drill_round = None
+        if body.kind == "drill":
+            if not body.group_id or not body.drill_round:
+                raise HTTPException(422, "a drill session needs group_id and drill_round")
+            group_id, drill_round = body.group_id, body.drill_round
+            planned, prep = DRILL_SECONDS[drill_round - 1], DRILL_PREP_SECONDS[drill_round - 1]
+            mine = [s for s in db.list_sessions() if s.get("group_id") == group_id]
+            if drill_round == 1:
+                topic_text = (body.topic_text or "").strip()
+                if not topic_text:
+                    raise HTTPException(422, "round 1 needs a topic")
+                if mine:
+                    raise HTTPException(409, "this drill already has a first round")
+            else:
+                first = [s for s in mine if s["drill_round"] == 1]
+                prev = [s for s in mine if s["drill_round"] == drill_round - 1 and s["audio_path"]]
+                if not first or not prev:
+                    raise HTTPException(409, "the previous round of this drill is not recorded yet")
+                topic_text = first[-1]["topic_text"]  # the same content, told again
         if start_date() is None:
             db.set_setting("start_date", local_today().isoformat())
             events.write("start_date.auto", None, start_date=local_today().isoformat())
@@ -254,9 +278,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "checkpoint": checkpoint, "topic_id": topic_id if body.kind == "baseline" else None, "topic_text": topic_text,
             "is_repeat": int(is_repeat), "planned_seconds": planned, "prep_seconds": prep, "status": "created",
             "client_info": json.dumps(body.client_info or {}, ensure_ascii=False),
+            "group_id": group_id, "drill_round": drill_round,
         })
         events.write("session.created", sid, kind=body.kind, checkpoint=checkpoint, topic_id=topic_id,
-                     planned_seconds=planned, client_info=body.client_info)
+                     planned_seconds=planned, group_id=group_id, drill_round=drill_round, client_info=body.client_info)
         return {"id": sid, "planned_seconds": planned, "prep_seconds": prep, "topic_text": topic_text}
 
     @app.post("/api/sessions/{sid}/audio")
@@ -369,6 +394,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sessions = db.list_sessions()
         metrics = {s["id"]: db.metrics_for(s["id"], METRICS_VERSION) for s in sessions if s["status"] == "done"}
         return build_progress(sessions, metrics, include_mock=include_mock)
+
+    def all_metrics() -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
+        sessions = db.list_sessions()
+        return sessions, {s["id"]: db.metrics_for(s["id"], METRICS_VERSION) for s in sessions if s["status"] == "done"}
+
+    @app.get("/api/drills")
+    def drills(include_mock: bool = False) -> list[dict[str, Any]]:
+        sessions, metrics = all_metrics()
+        return build_drills(sessions, metrics, include_mock=include_mock)
+
+    @app.get("/api/drills/{group_id}")
+    def drill(group_id: str, include_mock: bool = True) -> dict[str, Any]:
+        sessions, metrics = all_metrics()
+        for g in build_drills(sessions, metrics, include_mock=include_mock):
+            if g["group_id"] == group_id:
+                return g
+        raise HTTPException(404, "drill not found")
 
     @app.get("/api/export")
     def export(detail: bool = False) -> Response:

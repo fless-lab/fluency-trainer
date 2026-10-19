@@ -73,3 +73,18 @@ def topics_for_checkpoint(checkpoint_id: str) -> list[dict]:
         {"topic_id": t, "is_repeat": True, **TOPICS[t]} for t in cp["repeats"]
     ]
     return items
+
+
+# 4/3/2 drill: the same content told three times, in 4, 3 and then 2 minutes.
+DRILL_SECONDS = (240, 180, 120)
+DRILL_PREP_SECONDS = (30, 10, 10)
+DRILL_TOPICS: list[dict[str, str]] = [
+    {"id": "d1", "text": "Tell the story of a trip, a project or an event that did not go as expected."},
+    {"id": "d2", "text": "Explain how something you know well works, step by step."},
+    {"id": "d3", "text": "Describe a typical day in your life right now, and what you would change about it."},
+    {"id": "d4", "text": "Tell me about a teacher or mentor who mattered to you, and what you learned from them."},
+    {"id": "d5", "text": "Explain a problem you solved recently and how you approached it."},
+    {"id": "d6", "text": "Describe a place you would take a visitor to, and why."},
+    {"id": "d7", "text": "Tell me about a mistake that taught you something."},
+    {"id": "d8", "text": "Explain a concept from your field to someone with no background in it."},
+]
