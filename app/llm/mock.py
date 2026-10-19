@@ -17,6 +17,11 @@ class MockLLM:
     model = "mock"
 
     async def complete(self, system: str, user: str, max_tokens: int) -> LLMResult:
+        if "<intent>" in user:
+            im = re.search(r"<intent>(.*?)</intent>", user, re.S)
+            answer = {"options": [{"english": "Mock: " + (im.group(1).strip() if im else ""), "note": "Placeholder, not real advice."}],
+                      "tip": ""}
+            return LLMResult("mock", "mock", json.dumps(answer), {"input_tokens": 0, "output_tokens": 0})
         m = re.search(r"<transcript>\n(.*?)\n</transcript>", user, re.S)
         words = (m.group(1) if m else "").split()
         quote = " ".join(words[:6]) or "no transcript"

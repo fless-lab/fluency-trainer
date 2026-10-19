@@ -37,6 +37,14 @@ LLM_MODEL=exact model name from your provider
 
 `LLM_PROVIDER=mock` shows the screen with placeholder text, with no key and no cost. The feedback button appears in each session; it is never called automatically. Results are stored, so reopening a session costs nothing. `COACH_MAX_PER_DAY` (default 30) caps the requests per 24 hours. The transcript of the session is sent to the provider you choose; the audio is not. Token usage is written to the event log. Both adapters follow the providers' public API shape and are covered by tests with a fake server, but I have not run them against the live services.
 
+## Notebook: the expressions you could not find
+
+Fluency also breaks when you know a word but cannot get to it in time, or lack the natural way to say something. After a session, open it from History and click the word where you stopped or went around something. Write what you wanted to say, in any language. The app stores the moment (the words around it and the length of the pause) and, if a model is configured, proposes one to three natural ways to say it. You keep one, or write your own, and it enters the notebook.
+
+Review is spoken. The Notebook tab shows what you wanted to say, you say it aloud in English, reveal the answer, and report honestly: said it without stopping, hesitated, or could not. The next review moves out (same day, then 1, 3, 7, 14 and 30 days), stays at the same interval, or goes back to the start. Phrases from the feedback can be kept with one click. The notebook works without any model: you can add and choose versions by hand. Every add, suggestion and review is in the event log, and the tables are in the export.
+
+Limits to keep in mind: the model sees only the transcript, so on a short or unclear fragment it may guess your intent wrongly, which is why you write the intent yourself. The review is a self-check, not a pronunciation score. Suggestions count against the same `COACH_MAX_PER_DAY` cap as feedback. Not run against the live providers yet.
+
 ## Tracking and safety
 
 - `data/events.jsonl`: append-only log of every action, error, upload, transcription attempt and browser-side event (microphone refusals, recorder errors, upload failures).
@@ -64,4 +72,4 @@ python -m pytest -q
 
 ## Next
 
-Conversation partner with patient turn-taking, delayed feedback, and a memory of your recurring errors.
+Recurring error patterns across sessions, a pre-speaking box for the words you expect to need, and then a conversation partner with patient turn-taking.

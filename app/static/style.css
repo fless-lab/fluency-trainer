@@ -95,3 +95,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .small { font-size: 13px; }
 .wrapup { background: var(--warn-bg); color: var(--warn-text); padding: 8px 12px; border-radius: 8px; font-weight: 600; margin: 10px 0; }
 .wrapup[hidden] { display: none; }
+
+.transcript .w { cursor: pointer; }
+.transcript .w:hover { text-decoration: underline; }
+.transcript .w.sel { background: var(--mid); color: #fff; border-radius: 3px; }

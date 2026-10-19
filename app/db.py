@@ -67,6 +67,42 @@ CREATE TABLE IF NOT EXISTS coaching (
     raw TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_coaching_session ON coaching(session_id);
+CREATE TABLE IF NOT EXISTS notebook (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    session_id TEXT REFERENCES sessions(id),
+    word_index INTEGER,
+    pause_ms INTEGER,
+    intent TEXT NOT NULL,
+    context TEXT,
+    suggestions TEXT,
+    suggested_at TEXT,
+    suggest_provider TEXT,
+    suggest_model TEXT,
+    english TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    step INTEGER NOT NULL DEFAULT 0,
+    due_at TEXT,
+    reviews INTEGER NOT NULL DEFAULT 0,
+    last_reviewed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notebook_due ON notebook(status, due_at);
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    ref TEXT
+);
+CREATE TABLE IF NOT EXISTS notebook_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES notebook(id),
+    reviewed_at TEXT NOT NULL,
+    result TEXT NOT NULL,
+    step_before INTEGER NOT NULL,
+    step_after INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -208,6 +244,60 @@ class DB:
         with self.conn() as c:
             return int(c.execute("SELECT COUNT(*) FROM coaching WHERE created_at >= ?", (iso_prefix,)).fetchone()[0])
 
+    # notebook -------------------------------------------------------------
+    def _nb(self, r: sqlite3.Row | None) -> dict[str, Any] | None:
+        if not r:
+            return None
+        out = dict(r)
+        out["suggestions"] = json.loads(out["suggestions"]) if out.get("suggestions") else None
+        return out
+
+    def add_notebook(self, row: dict[str, Any]) -> int:
+        cols = ("created_at", "kind", "source", "session_id", "word_index", "pause_ms", "intent", "context",
+                "english", "status", "step", "due_at")
+        with self.conn() as c:
+            cur = c.execute(f"INSERT INTO notebook ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                            [row.get(k) for k in cols])
+            return int(cur.lastrowid)
+
+    def get_notebook(self, item_id: int) -> dict[str, Any] | None:
+        with self.conn() as c:
+            return self._nb(c.execute("SELECT * FROM notebook WHERE id = ?", (item_id,)).fetchone())
+
+    def list_notebook(self, due_before: str | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
+        q, args = "SELECT * FROM notebook WHERE status != 'archived'", []
+        if due_before:
+            q += " AND status IN ('learning','new') AND english IS NOT NULL AND due_at <= ?"; args.append(due_before)
+        if session_id:
+            q += " AND session_id = ?"; args.append(session_id)
+        with self.conn() as c:
+            return [self._nb(r) for r in c.execute(q + " ORDER BY due_at, id", args)]
+
+    def update_notebook(self, item_id: int, **fields: Any) -> None:
+        allowed = {"english", "status", "step", "due_at", "reviews", "last_reviewed_at", "suggestions",
+                   "suggested_at", "suggest_provider", "suggest_model"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"unknown notebook fields: {sorted(bad)}")
+        if "suggestions" in fields and not isinstance(fields["suggestions"], str):
+            fields["suggestions"] = json.dumps(fields["suggestions"], ensure_ascii=False)
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with self.conn() as c:
+            c.execute(f"UPDATE notebook SET {sets} WHERE id = ?", [*fields.values(), item_id])
+
+    def add_notebook_review(self, item_id: int, result: str, before: int, after: int) -> None:
+        with self.conn() as c:
+            c.execute("INSERT INTO notebook_reviews (item_id, reviewed_at, result, step_before, step_after) VALUES (?,?,?,?,?)",
+                      (item_id, utcnow(), result, before, after))
+
+    def log_llm_call(self, purpose: str, ref: str | None = None) -> None:
+        with self.conn() as c:
+            c.execute("INSERT INTO llm_calls (at, purpose, ref) VALUES (?,?,?)", (utcnow(), purpose, ref))
+
+    def count_llm_calls_since(self, iso_prefix: str) -> int:
+        with self.conn() as c:
+            return int(c.execute("SELECT COUNT(*) FROM llm_calls WHERE at >= ?", (iso_prefix,)).fetchone()[0])
+
     # settings -------------------------------------------------------------
     def get_setting(self, key: str) -> str | None:
         with self.conn() as c:
@@ -223,7 +313,7 @@ class DB:
         with self.conn() as c:
             out = {
                 t: [dict(r) for r in c.execute(f"SELECT * FROM {t}").fetchall()]
-                for t in ("sessions", "metrics", "ratings", "settings", "coaching")
+                for t in ("sessions", "metrics", "ratings", "settings", "coaching", "notebook", "notebook_reviews", "llm_calls")
             }
         for s in out["sessions"]:
             if s.get("client_info"):

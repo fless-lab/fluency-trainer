@@ -119,7 +119,7 @@ async function refreshState() {
   else banner.hidden = true;
 }
 
-const TABS = { today: renderToday, history: renderHistory, progress: renderProgress, data: renderData };
+const TABS = { today: renderToday, notebook: renderNotebook, history: renderHistory, progress: renderProgress, data: renderData };
 let currentTab = "today";
 async function show(tab) {
   currentTab = tab;
@@ -141,6 +141,7 @@ async function renderToday() {
   const pending = await pendingAll();
   let html = `<h2>Today</h2><p class="lead">Each test is 30 seconds of preparation, then 2 minutes of speaking. Do not write anything down. Speak the way you would to a person.</p>`;
   if (pending.length) html += `<div class="card"><strong>${pending.length} recording(s) saved on this device are not uploaded yet.</strong> <button class="secondary" id="retry-pending">Upload now</button></div>`;
+  if (STATE.notebook_due) html += `<div class="card due"><strong>${STATE.notebook_due} notebook item(s) to review.</strong> <button class="secondary" id="go-nb">Review now</button></div>`;
   if (STATE.day === null) html += `<p class="muted small">The 30 day counter starts when you record your first session. You can also <a href="#" id="start-today">start it today</a>.</p>`;
   for (const cp of STATE.checkpoints) {
     html += `<div class="card ${cp.due ? "due" : ""}"><div class="row spread"><h3>${esc(cp.label)}</h3><span class="tag">${cp.due ? "due" : `from day ${cp.due_day}`}</span></div><p class="muted small">${esc(cp.hint)}</p>`;
@@ -160,6 +161,7 @@ async function renderToday() {
   });
   view.querySelectorAll("button[data-cp]").forEach((b) => b.addEventListener("click", () => runSession({ kind: "baseline", checkpoint: b.dataset.cp, topic_id: b.dataset.topic })));
   $("#free-start").addEventListener("click", () => runSession({ kind: "free", topic_text: $("#free-topic").value.trim() || null, planned_seconds: Number($("#free-length").value) }));
+  const gnb = $("#go-nb"); if (gnb) gnb.addEventListener("click", () => show("notebook"));
   const rp = $("#retry-pending"); if (rp) rp.addEventListener("click", async () => { rp.disabled = true; await retryPending(); show("today"); });
   const st = $("#start-today"); if (st) st.addEventListener("click", async (e) => { e.preventDefault(); await api("/api/start", { method: "POST", body: {} }); show("today"); });
 }
@@ -369,7 +371,7 @@ function renderTranscript(detail) {
     const p = byIndex.get(i);
     if (p) out += `<span class="chip ${p.long ? "long" : p.type === "mid_clause" ? "mid" : "boundary"}" title="${esc(p.type)} pause">${(p.duration_ms / 1000).toFixed(1)}s</span>`;
     const isFiller = fillers.has(String(w.text).toLowerCase().replace(/[^a-z']/g, ""));
-    out += `<span class="w${isFiller ? " filler" : ""}">${esc(w.text)}</span> `;
+    out += `<span class="w${isFiller ? " filler" : ""}" data-i="${i}">${esc(w.text)}</span> `;
   });
   return out || '<span class="muted">No transcript.</span>';
 }
@@ -386,7 +388,8 @@ function renderSessionDetail(container, detail) {
     <div class="card scroll"><table><tbody>${rows || '<tr><td class="muted">No metrics.</td></tr>'}</tbody></table></div>
     <h3>Transcript</h3>
     <div class="legend">Pause chips: <span class="chip mid">mid-clause</span> <span class="chip boundary">clause boundary</span> <span class="chip long">over 1 s</span> · <span class="filler">fillers</span>. Classification is a heuristic.</div>
-    <div class="card transcript">${renderTranscript(detail)}</div>
+    <div class="card transcript" id="tr">${renderTranscript(detail)}</div>
+    <div id="gaps"></div>
     ${detail.has_audio ? `<audio controls preload="none" src="/api/sessions/${esc(detail.id)}/audio" style="width:100%"></audio>` : ""}
     <div id="coach"></div>
     <h3>How did it feel?</h3>
@@ -395,12 +398,136 @@ function renderSessionDetail(container, detail) {
     <div class="row" style="margin-top:8px"><button class="secondary" id="fb-save">Save notes</button><span id="fb-msg" class="muted small"></span></div>`;
   container.appendChild(wrap);
   setupCoach(wrap, detail);
+  setupGaps(wrap, detail);
   $("#fb-save", wrap).addEventListener("click", async () => {
     const rating = $("#fb-rating", wrap).value;
     try {
       await api(`/api/sessions/${detail.id}/feedback`, { method: "POST", body: { self_rating: rating ? Number(rating) : null, notes: $("#fb-notes", wrap).value || null } });
       $("#fb-msg", wrap).textContent = "Saved.";
     } catch (e) { $("#fb-msg", wrap).textContent = `Not saved: ${e.message}`; }
+  });
+}
+
+// ---------------------------------------------------------------- blocked moments and the notebook
+function itemCard(it, onChange) {
+  const el = document.createElement("div");
+  el.className = "card";
+  const llm = (STATE && STATE.llm) || {};
+  const sug = it.suggestions;
+  const opts = sug ? sug.options.map((o, i) => `<div class="small" style="margin:6px 0"><label><input type="radio" name="o${it.id}" value="${i}" ${(it.english ? it.english === o.english : i === 0) ? "checked" : ""}> <strong>${esc(o.english)}</strong></label><div class="muted" style="margin-left:22px">${esc(o.note)}</div></div>`).join("") : "";
+  el.innerHTML = `
+    <div class="tag">${esc(it.kind)}${it.pause_ms ? ` · stuck ${(it.pause_ms / 1000).toFixed(1)}s` : ""}${it.status === "new" ? " · choose a version" : ""}</div>
+    <p style="margin:4px 0"><span class="muted small">You wanted to say:</span> ${esc(it.intent)}</p>
+    ${it.context ? `<p class="small muted" style="margin:0 0 6px">Around: “${esc(it.context)}”</p>` : ""}
+    ${it.english ? `<p style="margin:4px 0"><span class="muted small">Keep:</span> <strong>${esc(it.english)}</strong></p>` : ""}
+    ${opts}${sug && sug.tip ? `<p class="small muted">${esc(sug.tip)}</p>` : ""}
+    <div class="row" style="margin-top:6px"></div><p class="err small" data-err></p>`;
+  const row = $(".row", el);
+  const err = $("[data-err]", el);
+  const call = async (path, body) => {
+    err.textContent = "";
+    try { const r = await api(path, { method: "POST", body: body || {} }); onChange(r.item); }
+    catch (e) { err.textContent = e.message; }
+  };
+  const btn = (label, cls, fn) => { const b = document.createElement("button"); b.className = cls; b.textContent = label; b.addEventListener("click", async () => { b.disabled = true; await fn(); b.disabled = false; }); row.appendChild(b); return b; };
+  if (llm.configured) btn(sug ? "Suggest again (uses credits)" : "Suggest English", sug ? "secondary" : "primary", () => call(`/api/notebook/${it.id}/suggest`));
+  if (sug) btn("Keep selected", "primary", async () => {
+    const r = el.querySelector(`input[name=o${it.id}]:checked`);
+    if (!r) { err.textContent = "Pick one version first."; return; }
+    await call(`/api/notebook/${it.id}/choose`, { english: sug.options[Number(r.value)].english });
+  });
+  btn("Write my own", "secondary", async () => {
+    const v = prompt("The English version you want to keep:", it.english || "");
+    if (v && v.trim()) await call(`/api/notebook/${it.id}/choose`, { english: v.trim() });
+  });
+  btn("Discard", "secondary", async () => { await call(`/api/notebook/${it.id}/archive`); });
+  return el;
+}
+
+async function setupGaps(root, detail) {
+  const box = $("#gaps", root);
+  if (!box || detail.status !== "done") return;
+  box.innerHTML = `<h3>Where you got stuck</h3><p class="muted small">Click the word where you stopped or went around something, then write what you wanted to say (any language). It goes into your notebook with natural English ways to say it.</p><div id="gap-form"></div><div id="gap-items"></div>`;
+  const items = $("#gap-items", box);
+  const draw = (list) => { items.innerHTML = ""; list.filter((i) => i.status !== "archived").forEach((it) => items.appendChild(itemCard(it, () => load()))); };
+  const load = async () => { try { draw((await api(`/api/notebook?session_id=${detail.id}`)).items); } catch (_) {} };
+  await load();
+  $("#tr", root).addEventListener("click", (e) => {
+    const w = e.target.closest(".w");
+    if (!w) return;
+    const idx = Number(w.dataset.i);
+    $("#tr", root).querySelectorAll(".w.sel").forEach((x) => x.classList.remove("sel"));
+    w.classList.add("sel");
+    const form = $("#gap-form", box);
+    form.innerHTML = `<div class="card"><p class="small" style="margin:0 0 6px">Stuck at: <strong>${esc(w.textContent)}</strong></p><input type="text" id="gap-intent" placeholder="What did you want to say?" style="width:100%" maxlength="400"><div class="row" style="margin-top:8px"><button class="primary" id="gap-save">Add to notebook</button><span class="err small" id="gap-err"></span></div></div>`;
+    $("#gap-intent", form).focus();
+    $("#gap-save", form).addEventListener("click", async () => {
+      const intent = $("#gap-intent", form).value.trim();
+      if (intent.length < 2) { $("#gap-err", form).textContent = "Write a few words."; return; }
+      try {
+        const r = await api(`/api/sessions/${detail.id}/gaps`, { method: "POST", body: { intent, word_index: idx } });
+        logEvent("gap_added", { word_index: idx }, detail.id);
+        form.innerHTML = ""; w.classList.remove("sel");
+        const llm = (STATE && STATE.llm) || {};
+        if (llm.configured) { try { await api(`/api/notebook/${r.item.id}/suggest`, { method: "POST", body: {} }); } catch (_) {} }
+        await load();
+      } catch (e) { $("#gap-err", form).textContent = e.message; }
+    });
+  });
+}
+
+async function renderNotebook() {
+  await refreshState();
+  const [dueR, allR] = await Promise.all([api("/api/notebook?due=true"), api("/api/notebook")]);
+  const llm = (STATE && STATE.llm) || {};
+  view.innerHTML = `<h2>Notebook</h2>
+    <p class="lead">Expressions you could not find while speaking. They come back on a widening schedule until you can say them without stopping.</p>
+    <div id="nb-due"></div>
+    <div class="card"><h3>Add one yourself</h3><div class="row"><input type="text" id="nb-intent" placeholder="What do you want to be able to say?" size="50" maxlength="400"><input type="text" id="nb-english" placeholder="English version (optional)" size="40" maxlength="300"><button class="primary" id="nb-add">Add</button></div><p class="err small" id="nb-err"></p></div>
+    <h3>All items</h3><div id="nb-all"></div>`;
+  const dueBox = $("#nb-due");
+  const reviewable = dueR.items;
+  if (!reviewable.length) dueBox.innerHTML = `<div class="card"><strong>Nothing due.</strong> <span class="muted small">Items appear here when their review date comes.</span></div>`;
+  else {
+    let i = 0;
+    const next = () => {
+      if (i >= reviewable.length) { dueBox.innerHTML = `<div class="card"><strong>Review done.</strong></div>`; return; }
+      const it = reviewable[i];
+      dueBox.innerHTML = `<div class="card due"><div class="row spread"><div class="tag">Review ${i + 1} of ${reviewable.length}</div></div>
+        <p class="small muted" style="margin:6px 0 0">Say this out loud in English, in a full sentence if you can:</p>
+        <p style="font-size:18px;margin:6px 0">${esc(it.intent)}</p>
+        ${it.context ? `<p class="small muted">Around: “${esc(it.context)}”</p>` : ""}
+        <div id="rv-answer"><button class="primary" id="rv-show">Show the English</button></div></div>`;
+      $("#rv-show").addEventListener("click", () => {
+        $("#rv-answer").innerHTML = `<p style="font-size:18px;margin:6px 0"><strong>${esc(it.english)}</strong></p><p class="small muted">Be honest. How did it go?</p><div class="row"><button class="primary" data-r="fluent">Said it without stopping</button><button class="secondary" data-r="hesitated">Hesitated</button><button class="secondary" data-r="failed">Could not say it</button></div>`;
+        dueBox.querySelectorAll("button[data-r]").forEach((b) => b.addEventListener("click", async () => {
+          await api(`/api/notebook/${it.id}/review`, { method: "POST", body: { result: b.dataset.r } });
+          logEvent("notebook_review", { item: it.id, result: b.dataset.r });
+          i += 1; next();
+        }));
+      });
+    };
+    next();
+  }
+  const allBox = $("#nb-all");
+  const drawAll = (list) => {
+    allBox.innerHTML = "";
+    if (!list.length) { allBox.innerHTML = `<p class="muted small">Empty. Mark where you got stuck after a session, or add items above.</p>`; return; }
+    list.forEach((it) => {
+      const el = it.status === "new" ? itemCard(it, () => renderNotebook()) : (() => {
+        const d = document.createElement("div"); d.className = "card";
+        d.innerHTML = `<div class="tag">${esc(it.status)} · ${it.reviews} review(s)${it.due_at ? ` · next ${esc(it.due_at.slice(0, 10))}` : ""}</div><p style="margin:4px 0"><span class="muted small">${esc(it.intent)}</span><br><strong>${esc(it.english)}</strong></p>`;
+        return d;
+      })();
+      allBox.appendChild(el);
+    });
+  };
+  drawAll(allR.items);
+  $("#nb-add").addEventListener("click", async () => {
+    const intent = $("#nb-intent").value.trim();
+    if (intent.length < 2) { $("#nb-err").textContent = "Write what you want to say."; return; }
+    try { await api("/api/notebook", { method: "POST", body: { kind: "phrase", intent, english: $("#nb-english").value.trim() || null } }); renderNotebook(); }
+    catch (e) { $("#nb-err").textContent = e.message; }
   });
 }
 
@@ -412,9 +539,19 @@ function renderCoaching(body, c) {
     <p>${esc(k.summary)}</p>
     ${k.strengths.length ? `<p class="small"><strong>What worked.</strong> ${k.strengths.map(esc).join(" ")}</p>` : ""}
     ${k.patterns.map((p) => `<div class="card"><div class="tag">${esc(p.tag)}</div><p style="margin:4px 0">${esc(p.issue)}</p>${p.why ? `<p class="small muted" style="margin:0 0 4px">${esc(p.why)}</p>` : ""}${examples(p)}</div>`).join("")}
-    ${k.phrases.length ? `<h3 style="margin-top:14px">Phrases to reuse</h3><ul>${k.phrases.map((ph) => `<li class="small"><strong>${esc(ph.phrase)}</strong>${ph.use ? ` <span class="muted">${esc(ph.use)}</span>` : ""}</li>`).join("")}</ul>` : ""}
+    ${k.phrases.length ? `<h3 style="margin-top:14px">Phrases to reuse</h3><ul>${k.phrases.map((ph, i) => `<li class="small"><strong>${esc(ph.phrase)}</strong>${ph.use ? ` <span class="muted">${esc(ph.use)}</span>` : ""} <button class="secondary keep" data-i="${i}" style="padding:0 8px">Keep</button></li>`).join("")}</ul>` : ""}
     ${k.focus_next ? `<div class="card due"><div class="tag">Next time, one thing</div><p style="margin:4px 0 0">${esc(k.focus_next)}</p></div>` : ""}
     <p class="small muted">From ${esc(c.provider)} (${esc(c.model)}). A language model reads the transcript, so it can be wrong or miss things the audio would show${c.provider === "mock" ? ". This one is a placeholder." : "."}</p>`;
+}
+
+function wireKeep(body, c, sessionId) {
+  body.querySelectorAll("button.keep").forEach((b) => b.addEventListener("click", async () => {
+    const ph = c.content.phrases[Number(b.dataset.i)];
+    try {
+      await api("/api/notebook", { method: "POST", body: { kind: "phrase", source: "coach", session_id: sessionId, intent: ph.use || ph.phrase, english: ph.phrase } });
+      b.textContent = "Kept"; b.disabled = true;
+    } catch (e) { b.textContent = "Not saved"; }
+  }));
 }
 
 async function setupCoach(root, detail) {
@@ -440,6 +577,7 @@ async function setupCoach(root, detail) {
   };
   const show_ = (c) => {
     renderCoaching(body, c);
+    wireKeep(body, c, detail.id);
     if (llm.configured) {
       const b = document.createElement("button");
       b.className = "secondary"; b.textContent = "Ask again (uses credits)"; b.style.marginTop = "8px";

@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import APP_VERSION
+from .notebook import KINDS, RESULTS, build_suggest_messages, clean, context_around, now_iso, parse_suggestions, schedule_after
 from .coach import COACH_VERSION, MIN_WORDS, build_messages, parse_feedback
 from .config import Settings, load_settings
 from .db import DB
@@ -72,6 +73,27 @@ class ClientEvent(BaseModel):
     type: str = Field(min_length=1, max_length=60, pattern=r"^[a-z0-9_.:-]+$")
     session_id: str | None = Field(default=None, max_length=64)
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class GapIn(BaseModel):
+    intent: str = Field(min_length=2, max_length=400)
+    word_index: int | None = Field(default=None, ge=0, le=100000)
+
+
+class NotebookIn(BaseModel):
+    kind: Literal["gap", "phrase", "word"] = "phrase"
+    intent: str = Field(min_length=2, max_length=400)
+    english: str | None = Field(default=None, max_length=300)
+    session_id: str | None = Field(default=None, max_length=64)
+    source: Literal["manual", "coach"] = "manual"
+
+
+class ChooseIn(BaseModel):
+    english: str = Field(min_length=1, max_length=300)
+
+
+class ReviewIn(BaseModel):
+    result: Literal["fluent", "hesitated", "failed"]
 
 
 class StartDate(BaseModel):
@@ -249,6 +271,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "prep_seconds": PREP_SECONDS,
             "speak_seconds": SPEAK_SECONDS,
             "checkpoints": cps,
+            "notebook_due": len(db.list_notebook(due_before=now_iso())),
             "llm": {"configured": llm is not None, "provider": llm.name if llm else None,
                     "model": llm.model if llm else None, "error": llm_error},
             "drill_topics": DRILL_TOPICS,
@@ -441,7 +464,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if existing and not regenerate:
                 return {"coaching": existing, "reused": True}  # no new spend
             since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="milliseconds")
-            if db.count_coaching_since(since) >= settings.coach_max_per_day:
+            if db.count_coaching_since(since) + db.count_llm_calls_since(since) >= settings.coach_max_per_day:
                 events.write("coach.cap_reached", sid, cap=settings.coach_max_per_day)
                 raise HTTPException(429, f"Daily cap of {settings.coach_max_per_day} feedback requests reached (COACH_MAX_PER_DAY).")
             if len(s["transcript_text"].split()) < MIN_WORDS:
@@ -464,6 +487,113 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                          model=result.model, usage=result.usage,
                          quotes_not_found=sum(1 for p in content["patterns"] for e in p["examples"] if not e["quote_found"]))
             return {"coaching": db.latest_coaching(sid, COACH_VERSION), "reused": False}
+
+    # notebook ---------------------------------------------------------------
+    def need_item(item_id: int) -> dict[str, Any]:
+        item = db.get_notebook(item_id)
+        if not item:
+            raise HTTPException(404, "notebook item not found")
+        return item
+
+    @app.get("/api/notebook")
+    def notebook_list(due: bool = False, session_id: str | None = None) -> dict[str, Any]:
+        items = db.list_notebook(due_before=now_iso() if due else None, session_id=session_id)
+        n_due = len(db.list_notebook(due_before=now_iso()))
+        return {"items": items, "due": n_due}
+
+    @app.post("/api/notebook", status_code=201)
+    def notebook_add(body: NotebookIn) -> dict[str, Any]:
+        if body.session_id:
+            need_session(body.session_id)
+        english = clean(body.english or "", 300) or None
+        item_id = db.add_notebook({
+            "created_at": now_iso(), "kind": body.kind, "source": body.source, "session_id": body.session_id,
+            "intent": clean(body.intent, 400), "english": english,
+            "status": "learning" if english else "new", "step": 0, "due_at": now_iso() if english else None,
+        })
+        events.write("notebook.add", body.session_id, item=item_id, kind=body.kind, source=body.source, has_english=bool(english))
+        return {"item": db.get_notebook(item_id)}
+
+    @app.post("/api/sessions/{sid}/gaps", status_code=201)
+    def gap_add(sid: str, body: GapIn) -> dict[str, Any]:
+        s = need_session(sid)
+        tr = load_transcript(s)
+        words = (tr or {}).get("words") or []
+        context, pause_ms = "", None
+        if body.word_index is not None and words:
+            context = context_around(words, body.word_index)
+            ws = {w["before_word_index"]: w for w in compute_metrics(words)["pauses"]}
+            pause_ms = ws[body.word_index]["duration_ms"] if body.word_index in ws else None
+        item_id = db.add_notebook({
+            "created_at": now_iso(), "kind": "gap", "source": "gap", "session_id": sid,
+            "word_index": body.word_index, "pause_ms": pause_ms, "intent": clean(body.intent, 400),
+            "context": context, "status": "new", "step": 0,
+        })
+        events.write("notebook.gap", sid, item=item_id, word_index=body.word_index, pause_ms=pause_ms)
+        return {"item": db.get_notebook(item_id)}
+
+    @app.post("/api/notebook/{item_id}/suggest")
+    async def notebook_suggest(item_id: int) -> dict[str, Any]:
+        item = need_item(item_id)
+        if llm is None:
+            raise HTTPException(503, llm_error or "No language model configured")
+        lock = coach_locks.setdefault(f"nb{item_id}", asyncio.Lock())
+        if lock.locked():
+            raise HTTPException(409, "suggestions for this item are already being generated")
+        async with lock:
+            since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="milliseconds")
+            if db.count_coaching_since(since) + db.count_llm_calls_since(since) >= settings.coach_max_per_day:
+                events.write("notebook.cap_reached", item["session_id"], item=item_id, cap=settings.coach_max_per_day)
+                raise HTTPException(429, f"Daily cap of {settings.coach_max_per_day} language model requests reached (COACH_MAX_PER_DAY).")
+            topic = None
+            if item["session_id"]:
+                sess = db.get_session(item["session_id"])
+                topic = sess["topic_text"] if sess else None
+            system, user = build_suggest_messages(item["intent"], item["context"] or "", topic)
+            db.log_llm_call("notebook.suggest", str(item_id))
+            events.write("notebook.suggest.start", item["session_id"], item=item_id, provider=llm.name, model=llm.model)
+            try:
+                result = await llm.complete(system, user, 700)
+            except LLMError as exc:
+                events.write("notebook.suggest.error", item["session_id"], item=item_id, error=str(exc))
+                raise HTTPException(502, str(exc)) from exc
+            try:
+                content = parse_suggestions(result.text)
+            except ValueError as exc:
+                events.write("notebook.suggest.unusable", item["session_id"], item=item_id, error=str(exc), raw=result.text[:2000])
+                raise HTTPException(502, f"The model's answer could not be used ({exc}). Try again.") from exc
+            db.update_notebook(item_id, suggestions=content, suggested_at=now_iso(),
+                               suggest_provider=result.provider, suggest_model=result.model)
+            events.write("notebook.suggest.done", item["session_id"], item=item_id, usage=result.usage, options=len(content["options"]))
+            return {"item": db.get_notebook(item_id)}
+
+    @app.post("/api/notebook/{item_id}/choose")
+    def notebook_choose(item_id: int, body: ChooseIn) -> dict[str, Any]:
+        item = need_item(item_id)
+        db.update_notebook(item_id, english=clean(body.english, 300), status="learning",
+                           due_at=item["due_at"] or now_iso())
+        events.write("notebook.choose", item["session_id"], item=item_id)
+        return {"item": db.get_notebook(item_id)}
+
+    @app.post("/api/notebook/{item_id}/review")
+    def notebook_review(item_id: int, body: ReviewIn) -> dict[str, Any]:
+        item = need_item(item_id)
+        if not item["english"]:
+            raise HTTPException(409, "choose the English version before reviewing this item")
+        nxt = schedule_after(item["step"], body.result)
+        db.add_notebook_review(item_id, body.result, item["step"], nxt["step"])
+        db.update_notebook(item_id, step=nxt["step"], status=nxt["status"], due_at=nxt["due_at"],
+                           reviews=item["reviews"] + 1, last_reviewed_at=now_iso())
+        events.write("notebook.review", item["session_id"], item=item_id, result=body.result,
+                     step_before=item["step"], step_after=nxt["step"])
+        return {"item": db.get_notebook(item_id)}
+
+    @app.post("/api/notebook/{item_id}/archive")
+    def notebook_archive(item_id: int) -> dict[str, Any]:
+        item = need_item(item_id)
+        db.update_notebook(item_id, status="archived")
+        events.write("notebook.archive", item["session_id"], item=item_id)
+        return {"ok": True}
 
     def all_metrics() -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
         sessions = db.list_sessions()
