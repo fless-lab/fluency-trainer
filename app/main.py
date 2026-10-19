@@ -385,8 +385,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     @app.get("/api/events.jsonl")
-    def events_file() -> FileResponse:
-        return FileResponse(events.path, media_type="application/x-ndjson", filename="events.jsonl")
+    def events_file() -> Response:
+        # The log keeps growing while it is being sent (this very request is logged), so a
+        # streamed file response would declare a length and then send more. Send a snapshot.
+        body = events.path.read_bytes()
+        return Response(body, media_type="application/x-ndjson",
+                        headers={"Content-Disposition": 'attachment; filename="events.jsonl"'})
 
     @app.get("/")
     def index() -> FileResponse:

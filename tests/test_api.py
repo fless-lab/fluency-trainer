@@ -179,3 +179,11 @@ def test_every_checkpoint_has_valid_topics():
     for cp in CHECKPOINTS:
         assert len(cp["topics"]) == 3
         assert topics_for_checkpoint(cp["id"])
+
+
+def test_event_log_download_is_a_consistent_snapshot(client):
+    record(client)
+    r = client.get("/api/events.jsonl")
+    assert r.status_code == 200
+    assert int(r.headers["content-length"]) == len(r.content)
+    assert all(json.loads(line) for line in r.text.splitlines())
