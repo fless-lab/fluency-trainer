@@ -9,6 +9,7 @@ A personal tool to measure and improve spoken English fluency. This first versio
 - Metrics per session: words per minute, articulation rate, phonation ratio, mean length of run, pauses of 250 ms or more (total, mid-clause, clause-boundary, over 1 second), fillers, repetitions, time to first word.
 - A progress table that tells you whether a change is larger than your own noise.
 - A transcript view with every pause marked, plus audio playback.
+- A detailed export (Data tab, or `/api/export?detail=true`) with every word and its timing, every pause and the quality flags.
 
 ## Run it
 

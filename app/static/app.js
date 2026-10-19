@@ -372,7 +372,7 @@ async function renderProgress() {
 async function renderData() {
   await refreshState();
   view.innerHTML = `<h2>Data</h2><p class="lead">Everything is stored on this computer, in the data folder next to the app.</p>
-    <div class="card"><div class="row"><a class="secondary" href="/api/export" download>Export sessions and metrics (JSON)</a><a class="secondary" href="/api/events.jsonl" download>Download the full event log</a></div>
+    <div class="card"><div class="row"><a class="secondary" href="/api/export" download>Export sessions and metrics (JSON)</a><a class="secondary" href="/api/export?detail=true" download>Detailed export: every word, pause and flag (JSON)</a><a class="secondary" href="/api/events.jsonl" download>Download the full event log</a></div>
     <p class="small muted">Every action is logged: sessions, uploads, transcription attempts and errors, recording events and microphone problems. Recordings and raw transcripts are never deleted by the app.</p></div>
     <div class="card"><h3>Counter</h3><p class="small">Start date: ${esc(STATE.start_date || "not started")} · app ${esc(STATE.version)} · metrics definitions v${esc(STATE.metrics_version)}</p><button class="secondary" id="reset-start">Set start date to today</button></div>`;
   $("#reset-start").addEventListener("click", async () => { if (confirm("Reset the 30 day counter to today?")) { await api("/api/start", { method: "POST", body: {} }); show("data"); } });

@@ -368,11 +368,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return build_progress(sessions, metrics, include_mock=include_mock)
 
     @app.get("/api/export")
-    def export() -> Response:
+    def export(detail: bool = False) -> Response:
         payload = {"exported_at": utcnow(), "app_version": APP_VERSION, "metrics_version": METRICS_VERSION, **db.export_all()}
-        events.write("export", None, sessions=len(payload["sessions"]))
+        if detail:
+            # per session: every word with its timing, every pause, and the quality flags
+            for s in payload["sessions"]:
+                tr = load_transcript(s)
+                if tr:
+                    computed = compute_metrics(tr["words"])
+                    s["words"] = tr["words"]
+                    s["pauses"] = computed["pauses"]
+                    s["flags"] = computed["flags"]
+        events.write("export", None, sessions=len(payload["sessions"]), detail=detail)
+        name = "fluency-export-detailed.json" if detail else "fluency-export.json"
         return Response(json.dumps(payload, ensure_ascii=False, indent=2), media_type="application/json",
-                        headers={"Content-Disposition": 'attachment; filename="fluency-export.json"'})
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     @app.get("/api/events.jsonl")
     def events_file() -> FileResponse:

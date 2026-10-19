@@ -148,6 +148,10 @@ def test_export_and_event_log_downloads(client):
     assert exp.status_code == 200
     data = exp.json()
     assert len(data["sessions"]) == 1 and data["metrics"] and "events" not in data
+    full = client.get("/api/export", params={"detail": True}).json()
+    sess = full["sessions"][0]
+    assert sess["words"] and sess["pauses"] is not None and "flags" in sess
+    assert "words" not in data["sessions"][0]  # the light export stays light
     ev = client.get("/api/events.jsonl")
     assert ev.status_code == 200 and ev.text.count("\n") >= 5
 
