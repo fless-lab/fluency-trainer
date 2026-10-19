@@ -36,7 +36,7 @@ window.addEventListener("unhandledrejection", (e) => logEvent("js_rejection", { 
 
 const fmt = (v, d = 1) => (v === null || v === undefined || Number.isNaN(v) ? "n/a" : Number(v).toFixed(d));
 const mmss = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
-function confetti(n = 36) {
+function confetti(n = 26) {
   if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
   const colors = ["#fcd84a", "#f472b6", "#6ee7b7", "#5cc8f0", "#ff7b5c", "#7c3aed"];
   const box = document.createElement("div");
@@ -186,8 +186,8 @@ function pickMime() {
   return options.find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || "";
 }
 
-function closeOverlay() { overlay.hidden = true; overlay.innerHTML = ""; document.body.style.overflow = ""; }
-function openOverlay(html) { overlay.hidden = false; document.body.style.overflow = "hidden"; overlay.innerHTML = `<div class="inner">${html}</div>`; return overlay.firstElementChild; }
+function closeOverlay() { document.body.classList.remove("busy"); overlay.hidden = true; overlay.innerHTML = ""; document.body.style.overflow = ""; }
+function openOverlay(html) { document.body.classList.add("busy"); overlay.hidden = false; document.body.style.overflow = "hidden"; overlay.innerHTML = `<div class="inner">${html}</div>`; return overlay.firstElementChild; }
 
 async function runSession(params, opts = {}) {
   let session;
@@ -690,7 +690,29 @@ async function renderData() {
   });
 })();
 
+// Measure the real frame rate for a moment after load. On a slow device or browser the decorative motion is
+// switched off ("calm" mode) so the app itself stays smooth. The result is written to the event log.
+function checkSmoothness() {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  let frames = 0, start = null, aborted = false;
+  const onHide = () => { aborted = true; };
+  document.addEventListener("visibilitychange", onHide, { once: true });
+  const tick = (t) => {
+    if (aborted) return;
+    if (start === null) start = t;
+    frames += 1;
+    if (t - start < 2000) { requestAnimationFrame(tick); return; }
+    document.removeEventListener("visibilitychange", onHide);
+    const fps = Math.round((frames - 1) / ((t - start) / 1000));
+    const calm = fps < 45;
+    if (calm) document.body.classList.add("calm");
+    logEvent("perf_check", { fps, calm, ua: navigator.userAgent.slice(0, 160) });
+  };
+  setTimeout(() => requestAnimationFrame(tick), 1200); // let the first render settle
+}
+
 (async function boot() {
+  checkSmoothness();
   try { await refreshState(); } catch (e) { view.innerHTML = `<p class="err">Cannot reach the server: ${esc(e.message)}</p>`; return; }
   retryPending().catch(() => {});
   logEvent("page_loaded", { ua: navigator.userAgent });
