@@ -283,7 +283,7 @@ async function runDrill(topicText) {
       {
         drill: true,
         label: `4/3/2 · round ${round} of 3 · ${mins} minutes`,
-        hint: round === 1 ? "Tell the story in full. You will tell it again, shorter, twice." : `Tell the same story again in ${mins} minutes. Same content, tighter and faster. Do not add new material.`,
+        hint: round === 1 ? "Tell the story in full, to someone who does not know it. You will tell it again, shorter, twice." : `Tell the same story again in ${mins} minutes. Imagine a new listener and use your own words, not the ones you remember. Same content, tighter and faster. Do not add new material.`,
         prepText: round === 1 ? "Preparation. Think, do not write." : "Short breath. Same story, less time.",
       });
     if (!sid) { logEvent("drill_stopped", { group_id: gid, at_round: round }, null); return; }
