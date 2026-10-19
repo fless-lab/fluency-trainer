@@ -64,6 +64,10 @@ Limits to keep in mind: the model sees only the transcript, so on a short or unc
 - Mid-clause versus clause-boundary pauses use punctuation and a short list of conjunctions. It is an approximation, not a syntactic analysis. Syllable counts, and so articulation rate, are estimated.
 - The research behind this found no study measuring gains at this dose, and most published effects come from learners below your level. The progress table is there so you can judge your own result, not to promise one.
 
+## Look
+
+Playful, colourful interface: cream paper with a dot grid, thick outlines, chunky buttons, a colour per tab, and a light or dark switch (top right, remembered in the browser). The Outfit font is bundled in `app/static/fonts` (SIL Open Font License, text included), so nothing is loaded from the internet. Decorative shapes and speech bubbles appear in the margins on wide screens only.
+
 ## Tests
 
 ```

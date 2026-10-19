@@ -123,6 +123,7 @@ const TABS = { today: renderToday, notebook: renderNotebook, history: renderHist
 let currentTab = "today";
 async function show(tab) {
   currentTab = tab;
+  document.body.dataset.tab = tab;
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   view.innerHTML = '<p class="muted">Loading…</p>';
   try { await TABS[tab](); } catch (e) { view.innerHTML = `<p class="err">Something went wrong: ${esc(e.message)}</p>`; logEvent("render_error", { tab, error: String(e) }); }
@@ -657,6 +658,23 @@ async function renderData() {
 }
 
 // ---------------------------------------------------------------- boot
+(function themeToggle() {
+  const b = $("#theme");
+  if (!b) return;
+  const paint = () => {
+    const cur = document.documentElement.dataset.theme || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    b.textContent = cur === "dark" ? "\u2600" : "\u263E";
+  };
+  paint();
+  b.addEventListener("click", () => {
+    const cur = document.documentElement.dataset.theme || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const next = cur === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("theme", next); } catch (_) {}
+    paint();
+  });
+})();
+
 (async function boot() {
   try { await refreshState(); } catch (e) { view.innerHTML = `<p class="err">Cannot reach the server: ${esc(e.message)}</p>`; return; }
   retryPending().catch(() => {});
