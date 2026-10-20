@@ -690,12 +690,18 @@ async function renderData() {
   });
 })();
 
-// While the tab is hidden the browser slows or freezes animations, and on return they jump to catch up.
-// Pausing the decoration meanwhile lets it resume from the same pose instead.
-document.addEventListener("visibilitychange", () => {
-  document.body.classList.toggle("away", document.hidden);
-  if (document.hidden) document.querySelectorAll(".confetti").forEach((c) => c.remove());
-});
+// When the tab is hidden or the window loses focus the browser slows or freezes animations, and on return they
+// jump to catch up. Pausing the decoration meanwhile lets it resume from the same pose instead.
+function syncAway() {
+  const away = document.hidden || !document.hasFocus();
+  document.body.classList.toggle("away", away);
+  if (away) document.querySelectorAll(".confetti").forEach((c) => c.remove());
+}
+document.addEventListener("visibilitychange", syncAway);
+window.addEventListener("blur", syncAway);
+window.addEventListener("focus", syncAway);
+window.addEventListener("pageshow", syncAway);
+syncAway();
 
 // Measure the real frame rate for a moment after load. On a slow device or browser the decorative motion is
 // switched off ("calm" mode) so the app itself stays smooth. The result is written to the event log.
