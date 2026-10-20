@@ -115,6 +115,10 @@ h3 { font-size: 20px; font-weight: 700; margin: 26px 0 10px; }
 .topic { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; padding: 12px 0; border-top: 2px dashed var(--line); }
 .topic:first-of-type { border-top: none; }
 .topic p { margin: 0; max-width: 62ch; }
+.topic > div:first-child { flex: 1 1 auto; min-width: 0; }
+.topic > .row { flex: 0 0 auto; flex-wrap: nowrap; }
+.topic button { white-space: nowrap; }
+@media (max-width: 560px) { .topic { flex-direction: column; } }
 .tag { display: inline-block; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: var(--ink); background: var(--mint); border: 2px solid var(--ink); border-radius: 99px; padding: 0 10px; transform: rotate(-1.5deg); }
 :root[data-theme="dark"] .tag { color: #0f0e24; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .tag { color: #0f0e24; } }
@@ -126,7 +130,8 @@ button.primary:hover, button.secondary:hover { transform: translateY(-1px); }
 button.primary:active, button.secondary:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--ink); }
 button:disabled { opacity: .5; cursor: default; transform: none; }
 select, input[type=text], textarea { font: inherit; padding: 8px 14px; border-radius: 14px; border: 2.5px solid var(--ink); background: var(--surface); color: var(--text); }
-input[type=text], select { border-radius: 99px; }
+input[type=text], select { border-radius: 99px; max-width: 100%; min-width: 0; text-overflow: ellipsis; }
+.row > input[type=text], .row > select { flex: 1 1 220px; }
 input::placeholder, textarea::placeholder { color: var(--muted); }
 input[type=radio] { accent-color: var(--accent); }
 textarea { width: 100%; min-height: 80px; }
