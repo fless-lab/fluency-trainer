@@ -67,12 +67,14 @@ body {
 .d-blob { bottom: -60px; right: 110px; width: 170px; height: 150px; border: 3px solid var(--ink); border-radius: 46% 54% 40% 60% / 55% 45% 55% 45%; background: var(--coral); transform: rotate(-8deg); }
 .d-pea { bottom: 40px; left: 180px; width: 26px; height: 26px; border: 3px solid var(--ink); border-radius: 50%; background: var(--yellow); }
 .d-wave { top: 760px; left: 20px; width: 120px; height: 40px; }
-.bubble { display: none; padding: 8px 16px; font-weight: 800; font-size: 19px; color: #1d1b38; border: 3px solid var(--ink); border-radius: 22px; box-shadow: 4px 4px 0 var(--ink); text-align: center; line-height: 1.15; }
-.bubble::after { content: ""; position: absolute; bottom: -13px; left: 26px; width: 18px; height: 18px; background: inherit; border-right: 3px solid var(--ink); border-bottom: 3px solid var(--ink); transform: rotate(45deg) skew(10deg, 10deg); border-radius: 0 0 6px 0; }
+.bubble { display: none; padding: 8px 18px; font-weight: 800; font-size: 19px; color: #1d1b38; border: 3px solid var(--ink); border-radius: 22px; box-shadow: 4px 4px 0 var(--ink); text-align: center; line-height: 1.15; }
+.bubble::before, .bubble::after { content: ""; position: absolute; width: 0; height: 0; border-style: solid; border-color: transparent; }
+.bubble::before { left: 22px; bottom: -17px; border-width: 17px 11px 0 11px; border-top-color: var(--ink); }
+.bubble::after { left: 25px; bottom: -12px; border-width: 12px 8px 0 8px; border-top-color: var(--fill); }
 @media (min-width: 1400px) { .bubble { display: block; } }
-.b-hey { top: 250px; right: 40px; background: var(--mint); transform: rotate(6deg); }
-.b-say { top: 380px; left: 24px; background: var(--yellow); width: 150px; transform: rotate(-5deg); }
-.b-go { top: 660px; right: 44px; background: var(--pink); width: 140px; transform: rotate(-4deg); }
+.b-hey { top: 250px; right: 40px; --fill: var(--mint); background: var(--fill); transform: rotate(6deg); }
+.b-say { top: 380px; left: 24px; --fill: var(--yellow); background: var(--fill); width: 150px; transform: rotate(-5deg); }
+.b-go { top: 660px; right: 44px; --fill: var(--pink); background: var(--fill); width: 140px; transform: rotate(-4deg); }
 header.top, .banner, .tabs, main { position: relative; z-index: 1; }
 
 .top, .tabs { padding-left: max(24px, calc((100vw - 980px) / 2 + 24px)); padding-right: max(24px, calc((100vw - 980px) / 2 + 24px)); }
@@ -169,19 +171,29 @@ audio { border-radius: 99px; }
 /* small animations: all switched off when the device asks for less motion.
    Only transform and opacity are animated, so the browser can do it on the graphics card
    without repainting. Only a few decorative items move; the rest stay still on purpose. */
-@keyframes float { 50% { transform: translate3d(0, -10px, 0) rotate(var(--r, 0deg)); } }
+@keyframes float { 50% { transform: translate3d(0, -12px, 0) rotate(var(--r, 0deg)); } }
+@keyframes sway { 25% { transform: translate3d(8px, -6px, 0) rotate(calc(var(--r, 0deg) + 6deg)); } 75% { transform: translate3d(-8px, 6px, 0) rotate(calc(var(--r, 0deg) - 6deg)); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes hop { 0%, 60%, 100% { transform: translate3d(0, 0, 0) rotate(var(--r, 0deg)); } 70% { transform: translate3d(0, -16px, 0) rotate(calc(var(--r, 0deg) + 5deg)); } 80% { transform: translate3d(0, 0, 0) rotate(var(--r, 0deg)); } 88% { transform: translate3d(0, -6px, 0) rotate(var(--r, 0deg)); } }
 @keyframes pop { from { opacity: 0; transform: translate3d(0, 14px, 0); } to { opacity: 1; transform: none; } }
 @keyframes bounce-in { 0% { opacity: 0; scale: .8; } 60% { opacity: 1; scale: 1.05; } 100% { scale: 1; } }
 @keyframes fall { 0% { opacity: 1; transform: translate3d(0, -20px, 0) rotate(0deg); } 100% { opacity: 0; transform: translate3d(var(--dx), 105vh, 0) rotate(var(--rot)); } }
-.d-sq { --r: 14deg; } .d-stripe { --r: 14deg; } .d-tri { --r: -12deg; transform: rotate(-12deg); }
+.d-sq { --r: 14deg; } .d-stripe { --r: 14deg; } .d-tri { --r: -12deg; transform: rotate(-12deg); } .d-blob { --r: -8deg; } .d-half, .d-dots, .d-pea, .d-ring { --r: 0deg; }
 .b-hey { --r: 6deg; } .b-say { --r: -5deg; } .b-go { --r: -4deg; }
-.d-sq, .d-stripe, .bubble, .d-zig { will-change: transform; animation: float 6s ease-in-out infinite; }
-.d-sq { animation-duration: 5.5s; animation-delay: -2s; }
-.d-stripe { animation-duration: 8s; animation-delay: -3s; }
-.b-hey { animation-duration: 4.5s; }
-.b-say { animation-duration: 5s; animation-delay: -1.5s; }
-.b-go { animation-duration: 5.5s; animation-delay: -3s; }
-.d-zig { animation-duration: 7s; animation-delay: -2.5s; }
+.deco { will-change: transform; animation: float 6s ease-in-out infinite; }
+.d-sq { animation: sway 6s ease-in-out infinite; }
+.d-tri { animation: sway 7s ease-in-out infinite -1s; }
+.d-stripe { animation: sway 8s ease-in-out infinite -3s; }
+.d-ring { border-style: dashed; animation: spin 24s linear infinite; }
+.d-half { animation: float 9s ease-in-out infinite -4s; }
+.d-dots { animation: float 7s ease-in-out infinite -2s; }
+.d-blob { animation: sway 10s ease-in-out infinite -5s; }
+.d-pea { animation: hop 3.2s ease-in-out infinite; }
+.d-zig { animation: float 5s ease-in-out infinite -2.5s; }
+.d-wave { animation: float 6s ease-in-out infinite -1s; }
+.b-hey { animation: hop 4s ease-in-out infinite; }
+.b-say { animation: float 5s ease-in-out infinite -1.5s; }
+.b-go { animation: hop 5s ease-in-out infinite -2s; }
 body.busy .deco { animation-play-state: paused; }
 body.calm .deco, body.calm main > *, body.calm h2, body.calm .brand { animation: none; will-change: auto; }
 body.calm .confetti { display: none; }
@@ -193,7 +205,8 @@ main > :nth-child(n+5) { animation-delay: .12s; }
 h2 { animation: bounce-in .45s cubic-bezier(.3, 1.5, .5, 1) backwards; }
 .brand { animation: bounce-in .5s cubic-bezier(.3, 1.5, .5, 1) backwards; }
 .tabs button { transition: transform .12s; }
-.tabs button:hover { transform: translateY(-2px); }
+.tabs button:hover { transform: translateY(-2px) rotate(-1.5deg); }
+button.primary:hover { transform: translateY(-1px) rotate(-1deg); }
 .overlay .inner { animation: pop .2s ease-out backwards; }
 .confetti { position: fixed; inset: 0; pointer-events: none; z-index: 50; overflow: hidden; contain: strict; }
 .confetti i { position: absolute; top: 0; width: 10px; height: 14px; border: 2px solid var(--ink); border-radius: 3px; will-change: transform; animation: fall 1.8s ease-in forwards; }
