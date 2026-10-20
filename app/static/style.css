@@ -209,6 +209,6 @@ button.primary:hover { rotate: -1deg; }
 }
 .d-tri { transform: rotate(-12deg); }
 /* pause the decoration while recording, and drop it on slow devices (see checkSmoothness in app.js) */
-body.busy .deco { animation-play-state: paused; }
+body.busy .deco, body.away .deco, body.away .confetti i { animation-play-state: paused; }
 body.calm .deco, body.calm main > *, body.calm h2, body.calm .brand { animation: none; }
 body.calm .confetti { display: none; }
