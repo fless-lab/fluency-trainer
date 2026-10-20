@@ -74,7 +74,7 @@ body {
 @media (min-width: 1400px) { .bubble { display: block; } }
 .b-hey { top: 250px; right: 40px; --fill: var(--mint); background: var(--fill); transform: rotate(6deg); }
 .b-say { top: 380px; left: 24px; --fill: var(--yellow); background: var(--fill); width: 150px; transform: rotate(-5deg); }
-.b-go { top: 660px; right: 44px; --fill: var(--pink); background: var(--fill); width: 140px; transform: rotate(-4deg); }
+.b-go { top: 660px; right: 44px; --fill: var(--pink); background: var(--fill); width: 165px; transform: rotate(-4deg); }
 header.top, .banner, .tabs, main { position: relative; z-index: 1; }
 
 .top, .tabs { padding-left: max(24px, calc((100vw - 980px) / 2 + 24px)); padding-right: max(24px, calc((100vw - 980px) / 2 + 24px)); }
@@ -168,50 +168,42 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .wrapup[hidden] { display: none; }
 audio { border-radius: 99px; }
 
-/* small animations: all switched off when the device asks for less motion.
-   Only transform and opacity are animated, so the browser can do it on the graphics card
-   without repainting. Only a few decorative items move; the rest stay still on purpose. */
-@keyframes float { 50% { transform: translate3d(0, -12px, 0) rotate(var(--r, 0deg)); } }
-@keyframes sway { 25% { transform: translate3d(8px, -6px, 0) rotate(calc(var(--r, 0deg) + 6deg)); } 75% { transform: translate3d(-8px, 6px, 0) rotate(calc(var(--r, 0deg) - 6deg)); } }
-@keyframes spin { to { transform: rotate(360deg); } }
-@keyframes hop { 0%, 60%, 100% { transform: translate3d(0, 0, 0) rotate(var(--r, 0deg)); } 70% { transform: translate3d(0, -16px, 0) rotate(calc(var(--r, 0deg) + 5deg)); } 80% { transform: translate3d(0, 0, 0) rotate(var(--r, 0deg)); } 88% { transform: translate3d(0, -6px, 0) rotate(var(--r, 0deg)); } }
-@keyframes pop { from { opacity: 0; transform: translate3d(0, 14px, 0); } to { opacity: 1; transform: none; } }
-@keyframes bounce-in { 0% { opacity: 0; scale: .8; } 60% { opacity: 1; scale: 1.05; } 100% { scale: 1; } }
-@keyframes fall { 0% { opacity: 1; transform: translate3d(0, -20px, 0) rotate(0deg); } 100% { opacity: 0; transform: translate3d(var(--dx), 105vh, 0) rotate(var(--rot)); } }
-.d-sq { --r: 14deg; } .d-stripe { --r: 14deg; } .d-tri { --r: -12deg; transform: rotate(-12deg); } .d-blob { --r: -8deg; } .d-half, .d-dots, .d-pea, .d-ring { --r: 0deg; }
-.b-hey { --r: 6deg; } .b-say { --r: -5deg; } .b-go { --r: -4deg; }
-.deco { will-change: transform; animation: float 6s ease-in-out infinite; }
-.d-sq { animation: sway 6s ease-in-out infinite; }
-.d-tri { animation: sway 7s ease-in-out infinite -1s; }
-.d-stripe { animation: sway 8s ease-in-out infinite -3s; }
-.d-ring { border-style: dashed; animation: spin 24s linear infinite; }
-.d-half { animation: float 9s ease-in-out infinite -4s; }
-.d-dots { animation: float 7s ease-in-out infinite -2s; }
-.d-blob { animation: sway 10s ease-in-out infinite -5s; }
-.d-pea { animation: hop 3.2s ease-in-out infinite; }
-.d-zig { animation: float 5s ease-in-out infinite -2.5s; }
-.d-wave { animation: float 6s ease-in-out infinite -1s; }
-.b-hey { animation: hop 4s ease-in-out infinite; }
-.b-say { animation: float 5s ease-in-out infinite -1.5s; }
-.b-go { animation: hop 5s ease-in-out infinite -2s; }
-body.busy .deco { animation-play-state: paused; }
-body.calm .deco, body.calm main > *, body.calm h2, body.calm .brand { animation: none; will-change: auto; }
-body.calm .confetti { display: none; }
-main > * { animation: pop .3s ease-out backwards; }
-main > :nth-child(2) { animation-delay: .03s; }
-main > :nth-child(3) { animation-delay: .06s; }
-main > :nth-child(4) { animation-delay: .09s; }
-main > :nth-child(n+5) { animation-delay: .12s; }
-h2 { animation: bounce-in .45s cubic-bezier(.3, 1.5, .5, 1) backwards; }
-.brand { animation: bounce-in .5s cubic-bezier(.3, 1.5, .5, 1) backwards; }
+/* small animations: all switched off when the device asks for less motion */
+@keyframes float { 50% { translate: 0 -10px; } }
+@keyframes pop { from { opacity: 0; translate: 0 16px; scale: .97; } to { opacity: 1; translate: 0 0; scale: 1; } }
+@keyframes bounce-in { 0% { opacity: 0; scale: .7; } 60% { opacity: 1; scale: 1.06; } 100% { scale: 1; } }
+@keyframes fall { 0% { opacity: 1; translate: 0 -20px; rotate: 0deg; } 100% { opacity: 0; translate: var(--dx) 105vh; rotate: var(--rot); } }
+.deco { animation: float 6s ease-in-out infinite; }
+.d-tri { animation-duration: 7s; animation-delay: -1s; }
+.d-sq { animation-duration: 5.5s; animation-delay: -2s; }
+.d-stripe { animation-duration: 8s; animation-delay: -3s; }
+.d-half, .d-blob { animation-duration: 9s; animation-delay: -4s; }
+.d-ring { animation-duration: 10s; }
+.bubble { animation-duration: 4.5s; }
+.b-say { animation-delay: -1.5s; }
+.b-go { animation-delay: -3s; }
+.d-zig, .d-wave { animation-duration: 7s; animation-delay: -2.5s; }
+main > * { animation: pop .35s ease-out both; }
+main > :nth-child(2) { animation-delay: .04s; }
+main > :nth-child(3) { animation-delay: .08s; }
+main > :nth-child(4) { animation-delay: .12s; }
+main > :nth-child(5) { animation-delay: .16s; }
+main > :nth-child(n+6) { animation-delay: .2s; }
+h2 { animation-name: bounce-in; animation-duration: .5s; animation-timing-function: cubic-bezier(.3, 1.5, .5, 1); }
+.brand { animation: bounce-in .6s cubic-bezier(.3, 1.5, .5, 1) both; }
 .tabs button { transition: transform .12s; }
-.tabs button:hover { transform: translateY(-2px) rotate(-1.5deg); }
-button.primary:hover { transform: translateY(-1px) rotate(-1deg); }
-.overlay .inner { animation: pop .2s ease-out backwards; }
-.confetti { position: fixed; inset: 0; pointer-events: none; z-index: 50; overflow: hidden; contain: strict; }
-.confetti i { position: absolute; top: 0; width: 10px; height: 14px; border: 2px solid var(--ink); border-radius: 3px; will-change: transform; animation: fall 1.8s ease-in forwards; }
+.tabs button:hover { transform: translateY(-2px) rotate(-1deg); }
+button.primary:hover { rotate: -1deg; }
+.overlay .inner { animation: pop .25s ease-out both; }
+.confetti { position: fixed; inset: 0; pointer-events: none; z-index: 50; overflow: hidden; }
+.confetti i { position: absolute; top: 0; width: 10px; height: 14px; border: 2px solid var(--ink); border-radius: 3px; animation: fall 1.8s ease-in forwards; }
 @media (prefers-reduced-motion: reduce) {
   .deco, main > *, h2, .brand, .overlay .inner { animation: none; }
-  .tabs button:hover { transform: none; }
+  .tabs button:hover, button.primary:hover { transform: none; rotate: none; }
   .confetti { display: none; }
 }
+.d-tri { transform: rotate(-12deg); }
+/* pause the decoration while recording, and drop it on slow devices (see checkSmoothness in app.js) */
+body.busy .deco { animation-play-state: paused; }
+body.calm .deco, body.calm main > *, body.calm h2, body.calm .brand { animation: none; }
+body.calm .confetti { display: none; }

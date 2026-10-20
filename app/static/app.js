@@ -36,7 +36,7 @@ window.addEventListener("unhandledrejection", (e) => logEvent("js_rejection", { 
 
 const fmt = (v, d = 1) => (v === null || v === undefined || Number.isNaN(v) ? "n/a" : Number(v).toFixed(d));
 const mmss = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
-function confetti(n = 26) {
+function confetti(n = 36) {
   if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
   const colors = ["#fcd84a", "#f472b6", "#6ee7b7", "#5cc8f0", "#ff7b5c", "#7c3aed"];
   const box = document.createElement("div");
