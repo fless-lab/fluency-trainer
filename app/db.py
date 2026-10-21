@@ -89,6 +89,27 @@ CREATE TABLE IF NOT EXISTS notebook (
     last_reviewed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_notebook_due ON notebook(status, due_at);
+CREATE TABLE IF NOT EXISTS conv_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    idx INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    words TEXT,
+    audio_path TEXT,
+    latency_ms INTEGER,
+    speech_ms INTEGER,
+    created_at TEXT NOT NULL,
+    UNIQUE (session_id, idx)
+);
+CREATE TABLE IF NOT EXISTS tts_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    session_id TEXT,
+    provider TEXT,
+    model TEXT,
+    characters INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS llm_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,
@@ -335,9 +356,43 @@ class DB:
         with self.conn() as c:
             c.execute("INSERT INTO llm_calls (at, purpose, ref) VALUES (?,?,?)", (utcnow(), purpose, ref))
 
-    def count_llm_calls_since(self, iso_prefix: str) -> int:
+    def add_turn(self, sid: str, role: str, text: str, words: list | None = None, audio_path: str | None = None,
+                 latency_ms: int | None = None, speech_ms: int | None = None) -> int:
         with self.conn() as c:
-            return int(c.execute("SELECT COUNT(*) FROM llm_calls WHERE at >= ?", (iso_prefix,)).fetchone()[0])
+            idx = int(c.execute("SELECT COALESCE(MAX(idx), -1) + 1 FROM conv_turns WHERE session_id = ?", (sid,)).fetchone()[0])
+            c.execute("INSERT INTO conv_turns (session_id, idx, role, text, words, audio_path, latency_ms, speech_ms, created_at) "
+                      "VALUES (?,?,?,?,?,?,?,?,?)",
+                      (sid, idx, role, text, json.dumps(words) if words is not None else None, audio_path,
+                       latency_ms, speech_ms, utcnow()))
+        return idx
+
+    def get_turns(self, sid: str) -> list[dict[str, Any]]:
+        with self.conn() as c:
+            rows = c.execute("SELECT * FROM conv_turns WHERE session_id = ? ORDER BY idx", (sid,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["words"] = json.loads(d["words"]) if d["words"] else None
+            out.append(d)
+        return out
+
+    def log_tts_call(self, sid: str | None, provider: str, model: str, characters: int) -> None:
+        with self.conn() as c:
+            c.execute("INSERT INTO tts_calls (at, session_id, provider, model, characters) VALUES (?,?,?,?,?)",
+                      (utcnow(), sid, provider, model, characters))
+
+    def tts_characters_since(self, iso: str) -> int:
+        with self.conn() as c:
+            return int(c.execute("SELECT COALESCE(SUM(characters), 0) FROM tts_calls WHERE at >= ?", (iso,)).fetchone()[0])
+
+    def count_llm_calls_since(self, iso_prefix: str, purpose: str | None = None, exclude: str | None = None) -> int:
+        q, args = "SELECT COUNT(*) FROM llm_calls WHERE at >= ?", [iso_prefix]
+        if purpose:
+            q += " AND purpose = ?"; args.append(purpose)
+        if exclude:
+            q += " AND purpose != ?"; args.append(exclude)
+        with self.conn() as c:
+            return int(c.execute(q, args).fetchone()[0])
 
     # settings -------------------------------------------------------------
     def get_setting(self, key: str) -> str | None:
@@ -354,7 +409,7 @@ class DB:
         with self.conn() as c:
             out = {
                 t: [dict(r) for r in c.execute(f"SELECT * FROM {t}").fetchall()]
-                for t in ("sessions", "metrics", "ratings", "settings", "coaching", "notebook", "notebook_reviews", "llm_calls", "session_targets", "notebook_uses")
+                for t in ("sessions", "metrics", "ratings", "settings", "coaching", "notebook", "notebook_reviews", "llm_calls", "session_targets", "notebook_uses", "conv_turns", "tts_calls")
             }
         for s in out["sessions"]:
             if s.get("client_info"):

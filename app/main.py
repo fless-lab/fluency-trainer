@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import time
@@ -17,7 +18,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import APP_VERSION
+from .conversation import CONV_VERSION, SYSTEM as CONV_SYSTEM, clean_reply, delays, opening_prompt, reply_prompt, stitch
 from .patterns import build_patterns
+from .tts.base import TTSError
+from .tts.mock import MockTTS
+from .tts.openai_compat import OpenAICompatTTS
 from .notebook import find_use, KINDS, RESULTS, build_suggest_messages, clean, context_around, now_iso, parse_suggestions, schedule_after
 from .coach import COACH_VERSION, MIN_WORDS, annotate_transcript, build_messages, parse_feedback
 from .config import Settings, load_settings
@@ -49,7 +54,7 @@ ALLOWED_MIME = {
 
 
 class NewSession(BaseModel):
-    kind: Literal["baseline", "free", "drill"]
+    kind: Literal["baseline", "free", "drill", "conversation"]
     group_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
     drill_round: int | None = Field(default=None, ge=1, le=3)
     checkpoint: str | None = None
@@ -62,6 +67,12 @@ class NewSession(BaseModel):
 class Feedback(BaseModel):
     self_rating: int | None = Field(default=None, ge=1, le=5)
     notes: str | None = Field(default=None, max_length=4000)
+
+
+class ConvStart(BaseModel):
+    scenario: str = Field(default="", max_length=400)
+    minutes: int = Field(default=10, ge=1, le=60)
+    client_info: dict[str, Any] | None = None
 
 
 class Rating(BaseModel):
@@ -133,6 +144,22 @@ def make_llm(settings: Settings) -> tuple[LLMProvider | None, str | None]:
     return None, f"Unknown LLM_PROVIDER '{name}'. Use openrouter, anthropic or mock."
 
 
+def make_tts(settings: Settings):
+    """Build the voice provider, or explain why there is none. Without one the browser's own voice is used."""
+    name = settings.tts_provider
+    if name in ("", "none"):
+        return None, "No voice configured: the browser's own voice is used."
+    if name == "mock":
+        return MockTTS(), None
+    if name in ("openrouter", "openai"):
+        if not settings.tts_key:
+            return None, "TTS_API_KEY is not set (for openrouter it falls back to LLM_API_KEY)."
+        if not settings.tts_model:
+            return None, "TTS_MODEL is not set."
+        return OpenAICompatTTS(name, settings.tts_key, settings.tts_model, settings.tts_voice, settings.tts_base_url), None
+    return None, f"Unknown TTS_PROVIDER '{name}'. Use openrouter, openai or mock."
+
+
 def local_today() -> Date:
     return datetime.now().astimezone().date()
 
@@ -146,6 +173,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     events = EventLog(data / "events.jsonl")
     provider, provider_error = make_provider(settings)
     llm, llm_error = make_llm(settings)
+    chat_llm, chat_error = (llm, llm_error)
+    if settings.llm_chat_model:
+        chat_llm, chat_error = make_llm(dataclasses.replace(settings, llm_model=settings.llm_chat_model))
+    tts, tts_error = make_tts(settings)
     coach_locks: dict[str, asyncio.Lock] = {}
     semaphore = asyncio.Semaphore(2)
 
@@ -474,7 +505,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if existing and not regenerate:
                 return {"coaching": existing, "reused": True}  # no new spend
             since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="milliseconds")
-            if db.count_coaching_since(since) + db.count_llm_calls_since(since) >= settings.coach_max_per_day:
+            if db.count_coaching_since(since) + db.count_llm_calls_since(since, exclude="chat") >= settings.coach_max_per_day:
                 events.write("coach.cap_reached", sid, cap=settings.coach_max_per_day)
                 raise HTTPException(429, f"Daily cap of {settings.coach_max_per_day} feedback requests reached (COACH_MAX_PER_DAY).")
             if len(s["transcript_text"].split()) < MIN_WORDS:
@@ -502,6 +533,175 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                          model=result.model, usage=result.usage,
                          quotes_not_found=sum(1 for p in content["patterns"] for e in p["examples"] if not e["quote_found"]))
             return {"coaching": db.latest_coaching(sid, COACH_VERSION), "reused": False}
+
+    # voice conversation -----------------------------------------------------
+    conv_dir = data / "conv"
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    conv_locks: dict[str, asyncio.Lock] = {}
+
+    def day_ago() -> str:
+        return (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="milliseconds")
+
+    def need_conv(sid: str) -> dict[str, Any]:
+        s = need_session(sid)
+        if s["kind"] != "conversation":
+            raise HTTPException(409, "this session is not a conversation")
+        return s
+
+    async def partner_say(sid: str, text: str) -> dict[str, Any]:
+        """Store the partner's line and make its audio when a voice is configured."""
+        idx = db.add_turn(sid, "partner", text)
+        audio_url, tts_note = None, tts_error
+        if tts is not None:
+            if db.tts_characters_since(day_ago()) + len(text) > settings.tts_max_chars_per_day:
+                events.write("tts.cap_reached", sid, cap=settings.tts_max_chars_per_day)
+                tts_note = f"Daily voice cap reached (TTS_MAX_CHARS_PER_DAY={settings.tts_max_chars_per_day}); the browser voice is used."
+            else:
+                try:
+                    started = time.monotonic()
+                    r = await tts.speak(text)
+                    ext = ".mp3" if "mpeg" in r.mime else ".wav" if "wav" in r.mime else ".bin"
+                    path = conv_dir / f"{sid}_{idx}{ext}"
+                    path.write_bytes(r.audio)
+                    with db.conn() as c:
+                        c.execute("UPDATE conv_turns SET audio_path = ? WHERE session_id = ? AND idx = ?", (str(path), sid, idx))
+                    db.log_tts_call(sid, r.provider, r.model, r.characters)
+                    events.write("tts.done", sid, idx=idx, characters=r.characters, provider=r.provider, model=r.model,
+                                 seconds=round(time.monotonic() - started, 2))
+                    audio_url, tts_note = f"/api/conversations/{sid}/turns/{idx}/audio", None
+                except TTSError as exc:
+                    events.write("tts.error", sid, idx=idx, error=str(exc))
+                    tts_note = str(exc)
+        return {"idx": idx, "text": text, "audio_url": audio_url, "voice_note": tts_note}
+
+    async def partner_reply(sid: str, s: dict[str, Any], opening: bool) -> str:
+        if chat_llm is None:
+            raise HTTPException(503, chat_error or "No language model configured")
+        if db.count_llm_calls_since(day_ago(), purpose="chat") >= settings.chat_max_per_day:
+            events.write("chat.cap_reached", sid, cap=settings.chat_max_per_day)
+            raise HTTPException(429, f"Daily cap of {settings.chat_max_per_day} partner replies reached (CHAT_MAX_PER_DAY).")
+        scenario = s["topic_text"] or "A relaxed, friendly chat."
+        prompt = opening_prompt(scenario) if opening else reply_prompt(scenario, db.get_turns(sid))
+        db.log_llm_call("chat", sid)
+        started = time.monotonic()
+        try:
+            r = await chat_llm.complete(CONV_SYSTEM, prompt, 220)
+        except LLMError as exc:
+            events.write("chat.error", sid, error=str(exc))
+            raise HTTPException(502, str(exc)) from exc
+        text = clean_reply(r.text)
+        if not text:
+            raise HTTPException(502, "The model returned an empty reply. Try again.")
+        events.write("chat.reply", sid, seconds=round(time.monotonic() - started, 2), model=r.model, usage=r.usage, opening=opening)
+        return text
+
+    @app.get("/api/conversations/config")
+    def conv_config() -> dict[str, Any]:
+        return {"llm_ready": chat_llm is not None, "llm_error": chat_error, "voice": tts.name if tts else None,
+                "voice_model": tts.model if tts else None, "voice_note": tts_error,
+                "chat_model": chat_llm.model if chat_llm else None}
+
+    @app.post("/api/conversations", status_code=201)
+    async def conv_start(body: ConvStart) -> dict[str, Any]:
+        if chat_llm is None:
+            raise HTTPException(503, chat_error or "No language model configured")
+        scenario = body.scenario.strip() or "A relaxed, friendly chat."
+        if start_date() is None:
+            db.set_setting("start_date", local_today().isoformat())
+        sid = uuid.uuid4().hex
+        db.create_session({
+            "id": sid, "created_at": utcnow(), "local_date": local_today().isoformat(), "kind": "conversation",
+            "checkpoint": None, "topic_id": None, "topic_text": scenario, "is_repeat": 0,
+            "planned_seconds": body.minutes * 60, "prep_seconds": 0, "status": "created",
+            "client_info": json.dumps(body.client_info or {}, ensure_ascii=False), "group_id": None, "drill_round": None,
+        })
+        events.write("conv.start", sid, scenario=scenario, minutes=body.minutes, voice=tts.name if tts else None)
+        try:
+            text = await partner_reply(sid, db.get_session(sid), opening=True)
+        except HTTPException:
+            db.update_session(sid, status="error", error="The partner could not start the conversation.")
+            raise
+        turn = await partner_say(sid, text)
+        return {"id": sid, "scenario": scenario, "turn": turn}
+
+    @app.get("/api/conversations/{sid}/turns/{idx}/audio")
+    def conv_turn_audio(sid: str, idx: int) -> FileResponse:
+        need_conv(sid)
+        for t in db.get_turns(sid):
+            if t["idx"] == idx and t["audio_path"] and Path(t["audio_path"]).is_file():
+                return FileResponse(t["audio_path"])
+        raise HTTPException(404, "no audio for this turn")
+
+    @app.post("/api/conversations/{sid}/turn")
+    async def conv_turn(sid: str, file: UploadFile = File(...), duration_s: float = Form(...), mime: str = Form(""),
+                        latency_ms: int | None = Form(None)) -> dict[str, Any]:
+        s = need_conv(sid)
+        if s["status"] == "done":
+            raise HTTPException(409, "this conversation is already finished")
+        if provider is None:
+            raise HTTPException(503, provider_error or "No speech provider configured")
+        base_mime = (mime or file.content_type or "").split(";")[0].strip().lower()
+        if base_mime not in ALLOWED_MIME:
+            raise HTTPException(415, f"unsupported audio type '{base_mime}'")
+        lock = conv_locks.setdefault(sid, asyncio.Lock())
+        if lock.locked():
+            raise HTTPException(409, "the previous turn is still being handled")
+        async with lock:
+            blob = await file.read()
+            if not blob or len(blob) > settings.max_upload_bytes:
+                raise HTTPException(422, "empty or too large recording")
+            n = len([t for t in db.get_turns(sid) if t["role"] == "user"])
+            path = conv_dir / f"{sid}_user{n}{ALLOWED_MIME[base_mime]}"
+            path.write_bytes(blob)
+            started = time.monotonic()
+            try:
+                result = await provider.transcribe(path, base_mime, duration_s)
+            except Exception as exc:  # noqa: BLE001
+                events.write("conv.stt_error", sid, error=str(exc))
+                raise HTTPException(502, f"Transcription failed: {exc}") from exc
+            events.write("conv.stt", sid, seconds=round(time.monotonic() - started, 2), words=len(result.words))
+            text = (result.text or "").strip()
+            if not result.words or not text:
+                return {"empty": True}
+            db.add_turn(sid, "user", text, words=result.words, audio_path=str(path), latency_ms=latency_ms,
+                        speech_ms=int(duration_s * 1000))
+            if db.get_session(sid)["status"] == "created":
+                db.update_session(sid, status="talking")
+            reply = await partner_reply(sid, s, opening=False)
+            turn = await partner_say(sid, reply)
+            return {"empty": False, "user_text": text, "turn": turn}
+
+    @app.post("/api/conversations/{sid}/end")
+    def conv_end(sid: str) -> dict[str, Any]:
+        s = need_conv(sid)
+        if s["status"] == "done":
+            return {"id": sid, "status": "done", "already": True}
+        turns = db.get_turns(sid)
+        words, text, seconds = stitch([t for t in turns if t["role"] == "user"])
+        if not words:
+            db.update_session(sid, status="error", error="No speech was captured in this conversation.")
+            events.write("conv.end_empty", sid)
+            return {"id": sid, "status": "error", "error": "No speech was captured."}
+        transcript_path = data / "transcripts" / f"{sid}.json"
+        transcript_path.write_text(json.dumps({"provider": "conversation", "job_id": None, "text": text, "words": words,
+                                                "audio_seconds": seconds, "raw": {"conv_version": CONV_VERSION}},
+                                               ensure_ascii=False), encoding="utf-8")
+        computed = compute_metrics(words)
+        if computed["values"]:
+            db.save_metrics(sid, METRICS_VERSION, computed["values"])
+        d = delays(turns)
+        db.update_session(sid, status="done", provider="conversation", transcript_path=str(transcript_path),
+                          transcript_text=text, audio_seconds=seconds, client_seconds=seconds,
+                          error=None if computed["values"] else f"No metrics computed: {', '.join(computed['flags'])}")
+        events.write("conv.end", sid, user_turns=len(d) or sum(1 for t in turns if t["role"] == "user"), speech_seconds=round(seconds, 1),
+                     delays_ms=d)
+        return {"id": sid, "status": "done", "delays_ms": d}
+
+    @app.get("/api/conversations/{sid}")
+    def conv_get(sid: str) -> dict[str, Any]:
+        s = need_conv(sid)
+        turns = [{k: t[k] for k in ("idx", "role", "text", "latency_ms", "created_at")} for t in db.get_turns(sid)]
+        return {"session": public_session(s), "turns": turns, "delays_ms": delays(db.get_turns(sid))}
 
     # notebook ---------------------------------------------------------------
     def need_item(item_id: int) -> dict[str, Any]:

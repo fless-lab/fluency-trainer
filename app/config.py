@@ -33,6 +33,14 @@ class Settings:
     llm_model: str = ""
     llm_base_url: str = ""
     coach_max_per_day: int = 30
+    llm_chat_model: str = ""
+    tts_provider: str = "none"
+    tts_key: str = ""
+    tts_model: str = ""
+    tts_voice: str = "alloy"
+    tts_base_url: str = ""
+    tts_max_chars_per_day: int = 60000
+    chat_max_per_day: int = 400
 
 
 def load_settings() -> Settings:
@@ -56,4 +64,13 @@ def load_settings() -> Settings:
         llm_model=os.environ.get("LLM_MODEL", "").strip(),
         llm_base_url=os.environ.get("LLM_BASE_URL", "").strip(),
         coach_max_per_day=int(os.environ.get("COACH_MAX_PER_DAY", "30")),
+        llm_chat_model=os.environ.get("LLM_CHAT_MODEL", "").strip(),
+        tts_provider=os.environ.get("TTS_PROVIDER", "none").strip().lower(),
+        tts_key=os.environ.get("TTS_API_KEY", "").strip() or (
+            os.environ.get("LLM_API_KEY", "").strip() if os.environ.get("TTS_PROVIDER", "").strip().lower() == "openrouter" else ""),
+        tts_model=os.environ.get("TTS_MODEL", "").strip(),
+        tts_voice=os.environ.get("TTS_VOICE", "alloy").strip(),
+        tts_base_url=os.environ.get("TTS_BASE_URL", "").strip(),
+        chat_max_per_day=int(os.environ.get("CHAT_MAX_PER_DAY", "400")),
+        tts_max_chars_per_day=int(os.environ.get("TTS_MAX_CHARS_PER_DAY", "60000")),
     )

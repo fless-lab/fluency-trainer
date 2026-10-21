@@ -17,6 +17,8 @@ class MockLLM:
     model = "mock"
 
     async def complete(self, system: str, user: str, max_tokens: int) -> LLMResult:
+        if "Write the Partner's next line" in user or "Start the conversation with" in user:
+            return LLMResult("mock", "mock", "Mock partner: tell me more about that.", {"input_tokens": 0, "output_tokens": 0})
         if "<intent>" in user:
             im = re.search(r"<intent>(.*?)</intent>", user, re.S)
             answer = {"options": [{"english": "Mock: " + (im.group(1).strip() if im else ""), "note": "Placeholder, not real advice."}],
