@@ -95,6 +95,21 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     purpose TEXT NOT NULL,
     ref TEXT
 );
+CREATE TABLE IF NOT EXISTS session_targets (
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    item_id INTEGER NOT NULL REFERENCES notebook(id),
+    source TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, item_id)
+);
+CREATE TABLE IF NOT EXISTS notebook_uses (
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    item_id INTEGER NOT NULL REFERENCES notebook(id),
+    used INTEGER NOT NULL,
+    matched TEXT,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, item_id)
+);
 CREATE TABLE IF NOT EXISTS notebook_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id INTEGER NOT NULL REFERENCES notebook(id),
@@ -290,6 +305,22 @@ class DB:
             c.execute("INSERT INTO notebook_reviews (item_id, reviewed_at, result, step_before, step_after) VALUES (?,?,?,?,?)",
                       (item_id, utcnow(), result, before, after))
 
+    def add_target(self, sid: str, item_id: int, source: str) -> None:
+        with self.conn() as c:
+            c.execute("INSERT OR IGNORE INTO session_targets (session_id, item_id, source, added_at) VALUES (?,?,?,?)",
+                      (sid, item_id, source, utcnow()))
+
+    def targets_for(self, sid: str) -> list[dict[str, Any]]:
+        with self.conn() as c:
+            rows = c.execute("SELECT t.item_id, t.source, n.intent, n.english FROM session_targets t "
+                             "JOIN notebook n ON n.id = t.item_id WHERE t.session_id = ? ORDER BY t.added_at", (sid,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def save_use(self, sid: str, item_id: int, used: bool, matched: str | None) -> None:
+        with self.conn() as c:
+            c.execute("INSERT OR REPLACE INTO notebook_uses (session_id, item_id, used, matched, checked_at) VALUES (?,?,?,?,?)",
+                      (sid, item_id, int(used), matched, utcnow()))
+
     def log_llm_call(self, purpose: str, ref: str | None = None) -> None:
         with self.conn() as c:
             c.execute("INSERT INTO llm_calls (at, purpose, ref) VALUES (?,?,?)", (utcnow(), purpose, ref))
@@ -313,7 +344,7 @@ class DB:
         with self.conn() as c:
             out = {
                 t: [dict(r) for r in c.execute(f"SELECT * FROM {t}").fetchall()]
-                for t in ("sessions", "metrics", "ratings", "settings", "coaching", "notebook", "notebook_reviews", "llm_calls")
+                for t in ("sessions", "metrics", "ratings", "settings", "coaching", "notebook", "notebook_reviews", "llm_calls", "session_targets", "notebook_uses")
             }
         for s in out["sessions"]:
             if s.get("client_info"):

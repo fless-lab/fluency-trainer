@@ -90,3 +90,44 @@ def test_suggest_needs_a_model(tmp_path):
         # the notebook still works by hand without any model
         assert c.post(f"/api/notebook/{g['id']}/choose", json={"english": "my idea"}).status_code == 200
     run(make(tmp_path, llm="none"), go)
+
+
+def test_find_use_ignores_fillers_and_accepts_a_small_slip():
+    from app.notebook import find_use
+    t = "my father, who um passed away when I was one, left us a house"
+    assert find_use("who passed away", t) == "who passed away"
+    assert find_use("who has passed away", t) is not None  # one extra word, close enough
+    assert find_use("stuck with me", t) is None
+    assert find_use("house", t) is None  # a single word proves nothing
+
+
+def test_targets_are_refused_in_baseline_and_usage_is_checked(tmp_path):
+    def go(c):
+        item = c.post("/api/notebook", json={"intent": "mourir", "english": "pass away"}).json()["item"]
+        base = c.post("/api/sessions", json={"kind": "baseline", "checkpoint": "base0", "topic_id": "a-personal"}).json()["id"]
+        assert c.post(f"/api/sessions/{base}/targets", json={"item_ids": [item["id"]]}).status_code == 409
+        free = c.post("/api/sessions", json={"kind": "free", "planned_seconds": 120}).json()["id"]
+        assert c.post(f"/api/sessions/{free}/targets", json={"item_ids": [999]}).status_code == 404
+        assert c.post(f"/api/sessions/{free}/targets", json={"item_ids": [item["id"]], "source": "prep"}).status_code == 201
+        assert c.get(f"/api/sessions/{free}/uses").json()["uses"][0]["used"] is None  # no transcript yet
+        sug = c.get("/api/notebook/suggested-targets").json()["items"]
+        assert [i["id"] for i in sug] == [item["id"]]
+    run(make(tmp_path), go)
+
+
+def test_a_target_phrase_said_in_the_talk_is_detected(tmp_path):
+    def go(c):
+        # the mock speech provider says "...the best option for everyone involved..." in every recording
+        item = c.post("/api/notebook", json={"intent": "la meilleure option", "english": "the best option for everyone"}).json()["item"]
+        other = c.post("/api/notebook", json={"intent": "rester en tête", "english": "stuck with me"}).json()["item"]
+        sid = c.post("/api/sessions", json={"kind": "free", "planned_seconds": 120}).json()["id"]
+        c.post(f"/api/sessions/{sid}/targets", json={"item_ids": [item["id"], other["id"]]})
+        assert c.post(f"/api/sessions/{sid}/targets", json={"item_ids": [item["id"]]}).status_code == 201  # idempotent
+        up = c.post(f"/api/sessions/{sid}/audio", files={"file": ("a.webm", b"x", "audio/webm")},
+                    data={"duration_s": "120", "mime": "audio/webm"})
+        assert up.status_code == 200
+        assert c.post(f"/api/sessions/{sid}/targets", json={"item_ids": [item["id"]]}).status_code == 409  # too late
+        uses = {u["item_id"]: u for u in c.get(f"/api/sessions/{sid}/uses").json()["uses"]}
+        assert uses[item["id"]]["used"] is True and uses[other["id"]]["used"] is False
+        assert len(c.get("/api/export").json()["notebook_uses"]) == 2
+    run(make(tmp_path), go)

@@ -107,3 +107,44 @@ _WS = re.compile(r"\s+")
 
 def clean(text: str, limit: int) -> str:
     return _WS.sub(" ", text or "").strip()[:limit]
+
+
+# ---- did the speaker actually use a target phrase while speaking? -------------------------------------
+_FILLERS = {"um", "umm", "uh", "uhh", "er", "erm", "uhm", "ehm", "hmm", "hm", "mm", "mmm"}
+_TOKEN = re.compile(r"[a-z0-9']+")
+
+
+def _tokens(text: str, drop_fillers: bool = True) -> list[str]:
+    toks = _TOKEN.findall((text or "").lower().replace("\u2019", "'"))
+    return [t for t in toks if not (drop_fillers and t in _FILLERS)]
+
+
+def find_use(phrase: str, transcript: str, threshold: float = 0.85) -> str | None:
+    """Return the stretch of the transcript that matches the phrase, or None.
+
+    Fillers are ignored on both sides. A near match (a small slip in one word) still counts, which is
+    an approximation: it can accept a close but different wording and miss a paraphrase.
+    """
+    want = _tokens(phrase)
+    if len(want) < 2:
+        return None  # a single common word proves nothing
+    have = _tokens(transcript)
+    n = len(want)
+    if n > len(have):
+        return None
+    joined = " ".join(want)
+    from difflib import SequenceMatcher
+    for i in range(len(have) - n + 1):
+        window = have[i:i + n]
+        if window == want:
+            return " ".join(window)
+    best, best_ratio = None, 0.0
+    for size in (n - 1, n, n + 1):
+        if size < 2 or size > len(have):
+            continue
+        for i in range(len(have) - size + 1):
+            window = " ".join(have[i:i + size])
+            r = SequenceMatcher(None, joined, window).ratio()
+            if r > best_ratio:
+                best, best_ratio = window, r
+    return best if best_ratio >= threshold else None

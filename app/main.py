@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import APP_VERSION
-from .notebook import KINDS, RESULTS, build_suggest_messages, clean, context_around, now_iso, parse_suggestions, schedule_after
+from .notebook import find_use, KINDS, RESULTS, build_suggest_messages, clean, context_around, now_iso, parse_suggestions, schedule_after
 from .coach import COACH_VERSION, MIN_WORDS, annotate_transcript, build_messages, parse_feedback
 from .config import Settings, load_settings
 from .db import DB
@@ -85,7 +85,12 @@ class NotebookIn(BaseModel):
     intent: str = Field(min_length=2, max_length=400)
     english: str | None = Field(default=None, max_length=300)
     session_id: str | None = Field(default=None, max_length=64)
-    source: Literal["manual", "coach"] = "manual"
+    source: Literal["manual", "coach", "prep"] = "manual"
+
+
+class TargetsIn(BaseModel):
+    item_ids: list[int] = Field(min_length=1, max_length=12)
+    source: Literal["prep", "due"] = "due"
 
 
 class ChooseIn(BaseModel):
@@ -591,6 +596,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         events.write("notebook.review", item["session_id"], item=item_id, result=body.result,
                      step_before=item["step"], step_after=nxt["step"])
         return {"item": db.get_notebook(item_id)}
+
+    @app.get("/api/notebook/suggested-targets")
+    def suggested_targets(limit: int = 3) -> dict[str, Any]:
+        """Items that are due, to try to place in the next free talk or drill. Never offered during baseline tests."""
+        items = [i for i in db.list_notebook(due_before=now_iso()) if i["english"]][:max(1, min(limit, 6))]
+        return {"items": items}
+
+    @app.post("/api/sessions/{sid}/targets", status_code=201)
+    def add_targets(sid: str, body: TargetsIn) -> dict[str, Any]:
+        s = need_session(sid)
+        if s["kind"] == "baseline":
+            raise HTTPException(409, "no help is allowed in baseline tests: it would change the measurement")
+        if s["status"] != "created":
+            raise HTTPException(409, "targets must be set before the recording is uploaded")
+        for item_id in body.item_ids:
+            item = need_item(item_id)
+            if not item["english"]:
+                raise HTTPException(409, f"item {item_id} has no English version yet")
+            db.add_target(sid, item_id, body.source)
+        events.write("targets.set", sid, items=body.item_ids, source=body.source)
+        return {"targets": db.targets_for(sid)}
+
+    @app.get("/api/sessions/{sid}/uses")
+    def target_uses(sid: str) -> dict[str, Any]:
+        s = need_session(sid)
+        out = []
+        for t in db.targets_for(sid):
+            used, matched = None, None
+            if s["status"] == "done" and s["transcript_text"]:
+                matched = find_use(t["english"], s["transcript_text"])
+                used = matched is not None
+                db.save_use(sid, t["item_id"], used, matched)
+            out.append({**t, "used": used, "matched": matched})
+        return {"uses": out}
 
     @app.post("/api/notebook/{item_id}/archive")
     def notebook_archive(item_id: int) -> dict[str, Any]:

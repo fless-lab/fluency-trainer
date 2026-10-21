@@ -189,6 +189,57 @@ function pickMime() {
 function closeOverlay() { document.body.classList.remove("busy"); overlay.hidden = true; overlay.innerHTML = ""; document.body.style.overflow = ""; }
 function openOverlay(html) { document.body.classList.add("busy"); overlay.hidden = false; document.body.style.overflow = "hidden"; overlay.innerHTML = `<div class="inner">${html}</div>`; return overlay.firstElementChild; }
 
+// ---------------------------------------------------------------- plan: phrases to aim for in a free talk or drill
+// Never used in baseline tests: any help there would change the measurement.
+async function planStage(stage, sid, isCancelled) {
+  const llm = (STATE && STATE.llm) || {};
+  const chosen = new Map();
+  stage.innerHTML = `<h3 style="margin-top:0">Phrases for this talk</h3>
+    <p class="muted small">Optional. Pick expressions from your notebook to try to use, and add what you expect to need but do not know how to say (any language). After the talk, the app checks which ones you really said.</p>
+    <div id="plan-due"></div>
+    <div class="card"><div class="row"><input type="text" id="plan-intent" placeholder="I want to be able to say…" maxlength="400" style="flex:1 1 260px"><button class="secondary" id="plan-add">Add</button></div><p class="err small" id="plan-err"></p><div id="plan-new"></div></div>
+    <div id="plan-chosen" class="small" style="margin:8px 0"></div>
+    <div class="row"><button class="primary" id="plan-go">Continue</button></div>`;
+  const drawChosen = () => { $("#plan-chosen", stage).innerHTML = chosen.size ? `<span class="muted">Aiming to use:</span> ${[...chosen.values()].map((c) => `<span class="chip boundary">${esc(c.english)}</span>`).join(" ")}` : ""; };
+  try {
+    const due = (await api("/api/notebook/suggested-targets?limit=3")).items;
+    $("#plan-due", stage).innerHTML = due.length ? `<div class="card"><div class="tag">Due in your notebook</div>${due.map((it) => `<label style="display:block;margin:6px 0"><input type="checkbox" data-id="${it.id}" checked> <strong>${esc(it.english)}</strong> <span class="muted small">${esc(it.intent)}</span></label>`).join("")}</div>` : "";
+    due.forEach((it) => chosen.set(it.id, { id: it.id, english: it.english, source: "due" }));
+    stage.querySelectorAll("#plan-due input[type=checkbox]").forEach((cb) => cb.addEventListener("change", () => {
+      const it = due.find((d) => String(d.id) === cb.dataset.id);
+      if (cb.checked) chosen.set(it.id, { id: it.id, english: it.english, source: "due" }); else chosen.delete(it.id);
+      drawChosen();
+    }));
+  } catch (_) {}
+  drawChosen();
+  const keep = (item, english) => { chosen.set(item.id, { id: item.id, english, source: "prep" }); drawChosen(); };
+  $("#plan-add", stage).addEventListener("click", async () => {
+    const intent = $("#plan-intent", stage).value.trim();
+    const err = $("#plan-err", stage); err.textContent = "";
+    if (intent.length < 2) { err.textContent = "Write a few words."; return; }
+    const box = $("#plan-new", stage);
+    try {
+      let item = (await api("/api/notebook", { method: "POST", body: { kind: "gap", source: "prep", intent, session_id: sid } })).item;
+      $("#plan-intent", stage).value = "";
+      logEvent("plan_added", {}, sid);
+      const holder = document.createElement("div"); box.appendChild(holder);
+      const showOptions = (it) => {
+        const opts = (it.suggestions && it.suggestions.options) || [];
+        holder.innerHTML = `<p class="small" style="margin:8px 0 2px"><span class="muted">You want to say:</span> ${esc(it.intent)}</p>${opts.map((o, i) => `<label style="display:block;margin:4px 0"><input type="radio" name="p${it.id}" value="${i}" ${i === 0 ? "checked" : ""}> <strong>${esc(o.english)}</strong> <span class="muted small">${esc(o.note)}</span></label>`).join("")}<div class="row" style="margin-top:4px">${opts.length ? `<button class="secondary" data-k>Keep selected</button>` : ""}<button class="secondary" data-own>Write my own</button></div>`;
+        const k = holder.querySelector("[data-k]");
+        if (k) k.addEventListener("click", async () => { const r = holder.querySelector("input:checked"); const english = opts[Number(r.value)].english; await api(`/api/notebook/${it.id}/choose`, { method: "POST", body: { english } }); keep(it, english); holder.innerHTML = ""; });
+        holder.querySelector("[data-own]").addEventListener("click", async () => { const v = prompt("The English version you want to use:", ""); if (v && v.trim()) { await api(`/api/notebook/${it.id}/choose`, { method: "POST", body: { english: v.trim() } }); keep(it, v.trim()); holder.innerHTML = ""; } });
+      };
+      if (llm.configured) { holder.innerHTML = `<p class="muted small">Looking for natural ways to say it…</p>`; try { item = (await api(`/api/notebook/${item.id}/suggest`, { method: "POST", body: {} })).item; } catch (e) { err.textContent = e.message; } }
+      showOptions(item);
+    } catch (e) { err.textContent = e.message; }
+  });
+  let done = false;
+  $("#plan-go", stage).addEventListener("click", () => { done = true; });
+  while (!done && !isCancelled()) await sleep(150);
+  return [...chosen.values()];
+}
+
 async function runSession(params, opts = {}) {
   let session;
   try {
@@ -219,11 +270,24 @@ async function runSession(params, opts = {}) {
   const mime = pickMime();
   if (!window.MediaRecorder) { stage.innerHTML = `<p class="err">This browser cannot record audio.</p>`; return; }
 
+  // 1b. optional plan of phrases to aim for (never in a baseline test)
+  let plan = opts.plan || (params.kind !== "baseline" ? { items: null } : null);
+  if (plan && plan.items === null) { plan.items = await planStage(stage, sid, () => cancelled); }
+  if (cancelled) return;
+  const aims = plan && plan.items ? plan.items : [];
+  if (aims.length) {
+    for (const src of ["due", "prep"]) {
+      const ids = aims.filter((a) => a.source === src).map((a) => a.id);
+      if (ids.length) { try { await api(`/api/sessions/${sid}/targets`, { method: "POST", body: { item_ids: ids, source: src } }); } catch (e) { logEvent("targets_failed", { error: String(e) }, sid); } }
+    }
+  }
+  const aimLine = aims.length ? `<p class="small muted" id="aim">Aim to use: ${aims.map((a) => `<strong>${esc(a.english)}</strong>`).join(" · ")}</p>` : "";
+
   // 2. preparation
   if (session.prep_seconds > 0) {
     logEvent("prep_started", { seconds: session.prep_seconds }, sid);
     let left = session.prep_seconds, ready = false;
-    stage.innerHTML = `<p class="muted">${esc(opts.prepText || "Preparation. Think, do not write.")}</p><div class="clock" id="clock">${mmss(left)}</div><button class="primary" id="ready">I'm ready</button>`;
+    stage.innerHTML = `<p class="muted">${esc(opts.prepText || "Preparation. Think, do not write.")}</p><div class="clock" id="clock">${mmss(left)}</div>${aimLine}<button class="primary" id="ready">I'm ready</button>`;
     $("#ready", stage).addEventListener("click", () => { ready = true; });
     while (left > 0 && !ready && !cancelled) { await sleep(1000); left -= 1; const c = $("#clock", stage); if (c) c.textContent = mmss(Math.max(left, 0)); }
     if (cancelled) return;
@@ -240,7 +304,7 @@ async function runSession(params, opts = {}) {
   const t0 = performance.now();
   recorder.start(1000);
   logEvent("record_started", { mime: recorder.mimeType, planned }, sid);
-  stage.innerHTML = `<p><span class="rec-dot"></span>Recording. Keep going until the timer ends.</p><div class="clock" id="clock">${mmss(0)}</div><p class="wrapup" id="wrapup" hidden>20 seconds left. Finish your thought and conclude.</p><button class="secondary" id="stop">Stop early</button>`;
+  stage.innerHTML = `<p><span class="rec-dot"></span>Recording. Keep going until the timer ends.</p><div class="clock" id="clock">${mmss(0)}</div><p class="wrapup" id="wrapup" hidden>20 seconds left. Finish your thought and conclude.</p>${aimLine}<button class="secondary" id="stop">Stop early</button>`;
   let stopped = false;
   let cueShown = false;
   $("#stop", stage).addEventListener("click", () => { stopped = true; });
@@ -292,12 +356,13 @@ async function runDrill(topicText) {
   const gid = newGroupId();
   const secs = STATE.drill_seconds || [240, 180, 120];
   logEvent("drill_started", { group_id: gid }, null);
+  const plan = { items: null };
   for (let round = 1; round <= 3; round++) {
     const mins = minutes(secs[round - 1]);
     const sid = await runSession(
       { kind: "drill", group_id: gid, drill_round: round, topic_text: round === 1 ? topicText : undefined },
       {
-        drill: true,
+        drill: true, plan,
         label: `4/3/2 · round ${round} of 3 · ${mins} minutes`,
         hint: round === 1 ? "Tell the story in full, to someone who does not know it. You will tell it again, shorter, twice." : `Tell the same story again in ${mins} minutes. Imagine a new listener and use your own words, not the ones you remember. Same content, tighter and faster. Do not add new material.`,
         prepText: round === 1 ? "Preparation. Think, do not write." : "Short breath. Same story, less time.",
@@ -405,6 +470,7 @@ function renderSessionDetail(container, detail) {
     <h3>Transcript</h3>
     <div class="legend">Pause chips: <span class="chip mid">mid-clause</span> <span class="chip boundary">clause boundary</span> <span class="chip long">over 1 s</span> · <span class="filler">fillers</span>. Classification is a heuristic.</div>
     <div class="card transcript" id="tr">${renderTranscript(detail)}</div>
+    <div id="uses"></div>
     <div id="gaps"></div>
     ${detail.has_audio ? `<audio controls preload="none" src="/api/sessions/${esc(detail.id)}/audio" style="width:100%"></audio>` : ""}
     <div id="coach"></div>
@@ -414,6 +480,7 @@ function renderSessionDetail(container, detail) {
     <div class="row" style="margin-top:8px"><button class="secondary" id="fb-save">Save notes</button><span id="fb-msg" class="muted small"></span></div>`;
   container.appendChild(wrap);
   setupCoach(wrap, detail);
+  setupUses(wrap, detail);
   setupGaps(wrap, detail);
   $("#fb-save", wrap).addEventListener("click", async () => {
     const rating = $("#fb-rating", wrap).value;
@@ -458,6 +525,22 @@ function itemCard(it, onChange) {
   });
   btn("Discard", "secondary", async () => { await call(`/api/notebook/${it.id}/archive`); });
   return el;
+}
+
+async function setupUses(root, detail) {
+  const box = $("#uses", root);
+  if (!box || detail.status !== "done") return;
+  let uses = [];
+  try { uses = (await api(`/api/sessions/${detail.id}/uses`, {})).uses; } catch (_) {}
+  if (!uses.length) return;
+  const said = uses.filter((u) => u.used).length;
+  box.innerHTML = `<h3>Phrases you aimed for</h3><p class="muted small">${said} of ${uses.length} found in the transcript. The check looks for the words in order and ignores fillers, so a different wording of the same idea is not counted.</p>` +
+    uses.map((u) => `<div class="card"><div class="tag">${u.used ? "said" : "not said"}</div> <strong>${esc(u.english)}</strong>${u.used ? `<p class="small muted" style="margin:4px 0">Heard: “${esc(u.matched)}”</p>` : ""}${u.used ? `<div class="row"><button class="secondary" data-fluent="${u.item_id}">Counts as a fluent review</button></div>` : ""}</div>`).join("");
+  box.querySelectorAll("[data-fluent]").forEach((b) => b.addEventListener("click", async () => {
+    b.disabled = true;
+    try { await api(`/api/notebook/${b.dataset.fluent}/review`, { method: "POST", body: { result: "fluent" } }); b.textContent = "Recorded"; logEvent("use_counted_fluent", { item: Number(b.dataset.fluent) }, detail.id); }
+    catch (e) { b.textContent = "Not recorded"; }
+  }));
 }
 
 async function setupGaps(root, detail) {
