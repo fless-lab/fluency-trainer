@@ -10,6 +10,44 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// Click to hear: any element with data-say speaks its text with the app's voice (made once on the server, then cached),
+// or with the browser voice if the app's voice is not available. Use sayable(text) in templates.
+let sayAudio = null, sayEl = null;
+function sayable(text, shown) {
+  return `<span class="say" role="button" tabindex="0" data-say="${esc(text)}" title="Click to hear it">${esc(shown == null ? text : shown)}</span>`;
+}
+// words between quotes in a sentence become clickable too: Practice with 'red' vs 'led'
+function sayQuoted(text) {
+  return esc(text).replace(/(&#39;|&quot;|‘|“)([A-Za-z][A-Za-z -]{0,28}[A-Za-z])(&#39;|&quot;|’|”)/g, (m, a, w, b) => `${a}<span class="say" role="button" tabindex="0" data-say="${w}" title="Click to hear it">${w}</span>${b}`);
+}
+function stopSay() {
+  if (sayEl) { sayEl.classList.remove("saying"); sayEl = null; }
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+  if (sayAudio) { const a = sayAudio; sayAudio = null; a.pause(); a.dispatchEvent(new Event("ended")); }
+}
+async function sayText(text, el) {
+  stopSay();
+  if (el) { el.classList.add("saying"); sayEl = el; }
+  const a = new Audio(`/api/say?text=${encodeURIComponent(text)}`);
+  sayAudio = a;
+  try {
+    await new Promise((res, rej) => { a.onended = res; a.onerror = () => rej(new Error("no audio")); a.play().catch(rej); });
+  } catch (_) {
+    if (sayAudio === a) await speakBrowser(text);  // the app's voice is not set up, capped, or failed: the browser voice
+  }
+  if (sayAudio === a) sayAudio = null;
+  if (el && sayEl === el) { el.classList.remove("saying"); sayEl = null; }
+}
+document.addEventListener("click", (e) => {
+  const el = e.target.closest && e.target.closest("[data-say]");
+  if (!el) return;
+  e.preventDefault();  // inside a label this must not tick the box next to it
+  sayText(el.dataset.say, el);
+});
+document.addEventListener("keydown", (e) => {
+  if ((e.key === "Enter" || e.key === " ") && e.target.matches && e.target.matches("[data-say]")) { e.preventDefault(); sayText(e.target.dataset.say, e.target); }
+});
+
 async function api(path, options = {}) {
   const opts = { ...options };
   if (opts.body && !(opts.body instanceof FormData)) {
@@ -205,7 +243,7 @@ async function planStage(stage, sid, isCancelled) {
   const drawChosen = () => { $("#plan-chosen", stage).innerHTML = chosen.size ? `<span class="muted">Aiming to use:</span> ${[...chosen.values()].map((c) => `<span class="chip boundary">${esc(c.english)}</span>`).join(" ")}` : ""; };
   try {
     const due = (await api("/api/notebook/suggested-targets?limit=3")).items;
-    $("#plan-due", stage).innerHTML = due.length ? `<div class="card"><div class="tag">Due in your notebook</div>${due.map((it) => `<label style="display:block;margin:6px 0"><input type="checkbox" data-id="${it.id}" checked> <strong>${esc(it.english)}</strong> <span class="muted small">${esc(it.intent)}</span></label>`).join("")}</div>` : "";
+    $("#plan-due", stage).innerHTML = due.length ? `<div class="card"><div class="tag">Due in your notebook</div>${due.map((it) => `<label style="display:block;margin:6px 0"><input type="checkbox" data-id="${it.id}" checked> <strong>${sayable(it.english)}</strong> <span class="muted small">${esc(it.intent)}</span></label>`).join("")}</div>` : "";
     due.forEach((it) => chosen.set(it.id, { id: it.id, english: it.english, source: "due" }));
     stage.querySelectorAll("#plan-due input[type=checkbox]").forEach((cb) => cb.addEventListener("change", () => {
       const it = due.find((d) => String(d.id) === cb.dataset.id);
@@ -227,7 +265,7 @@ async function planStage(stage, sid, isCancelled) {
       const holder = document.createElement("div"); box.appendChild(holder);
       const showOptions = (it) => {
         const opts = (it.suggestions && it.suggestions.options) || [];
-        holder.innerHTML = `<p class="small" style="margin:8px 0 2px"><span class="muted">You want to say:</span> ${esc(it.intent)}</p>${opts.map((o, i) => `<label style="display:block;margin:4px 0"><input type="radio" name="p${it.id}" value="${i}" ${i === 0 ? "checked" : ""}> <strong>${esc(o.english)}</strong> <span class="muted small">${esc(o.note)}</span></label>`).join("")}<div class="row" style="margin-top:4px">${opts.length ? `<button class="secondary" data-k>Keep selected</button>` : ""}<button class="secondary" data-own>Write my own</button></div>`;
+        holder.innerHTML = `<p class="small" style="margin:8px 0 2px"><span class="muted">You want to say:</span> ${esc(it.intent)}</p>${opts.map((o, i) => `<label style="display:block;margin:4px 0"><input type="radio" name="p${it.id}" value="${i}" ${i === 0 ? "checked" : ""}> <strong>${sayable(o.english)}</strong> <span class="muted small">${esc(o.note)}</span></label>`).join("")}<div class="row" style="margin-top:4px">${opts.length ? `<button class="secondary" data-k>Keep selected</button>` : ""}<button class="secondary" data-own>Write my own</button></div>`;
         const k = holder.querySelector("[data-k]");
         if (k) k.addEventListener("click", async () => { const r = holder.querySelector("input:checked"); const english = opts[Number(r.value)].english; await api(`/api/notebook/${it.id}/choose`, { method: "POST", body: { english } }); keep(it, english); holder.innerHTML = ""; });
         holder.querySelector("[data-own]").addEventListener("click", async () => { const v = prompt("The English version you want to use:", ""); if (v && v.trim()) { await api(`/api/notebook/${it.id}/choose`, { method: "POST", body: { english: v.trim() } }); keep(it, v.trim()); holder.innerHTML = ""; } });
@@ -283,7 +321,7 @@ async function runSession(params, opts = {}) {
       if (ids.length) { try { await api(`/api/sessions/${sid}/targets`, { method: "POST", body: { item_ids: ids, source: src } }); } catch (e) { logEvent("targets_failed", { error: String(e) }, sid); } }
     }
   }
-  const aimLine = aims.length ? `<p class="small muted" id="aim">Aim to use: ${aims.map((a) => `<strong>${esc(a.english)}</strong>`).join(" · ")}</p>` : "";
+  const aimLine = aims.length ? `<p class="small muted" id="aim">Aim to use: ${aims.map((a) => `<strong>${sayable(a.english)}</strong>`).join(" · ")}</p>` : "";
 
   // 2. preparation
   if (session.prep_seconds > 0) {
@@ -501,12 +539,12 @@ function itemCard(it, onChange) {
   el.className = "card";
   const llm = (STATE && STATE.llm) || {};
   const sug = it.suggestions;
-  const opts = sug ? sug.options.map((o, i) => `<div class="small" style="margin:6px 0"><label><input type="radio" name="o${it.id}" value="${i}" ${(it.english ? it.english === o.english : i === 0) ? "checked" : ""}> <strong>${esc(o.english)}</strong></label><div class="muted" style="margin-left:22px">${esc(o.note)}</div></div>`).join("") : "";
+  const opts = sug ? sug.options.map((o, i) => `<div class="small" style="margin:6px 0"><label><input type="radio" name="o${it.id}" value="${i}" ${(it.english ? it.english === o.english : i === 0) ? "checked" : ""}> <strong>${sayable(o.english)}</strong></label><div class="muted" style="margin-left:22px">${esc(o.note)}</div></div>`).join("") : "";
   el.innerHTML = `
     <div class="tag">${esc(it.kind)}${it.pause_ms ? ` · stuck ${(it.pause_ms / 1000).toFixed(1)}s` : ""}${it.status === "new" ? " · choose a version" : ""}</div>
     <p style="margin:4px 0"><span class="muted small">You wanted to say:</span> ${esc(it.intent)}</p>
     ${it.context ? `<p class="small muted" style="margin:0 0 6px">Around: “${esc(it.context)}”</p>` : ""}
-    ${it.english ? `<p style="margin:4px 0"><span class="muted small">Keep:</span> <strong>${esc(it.english)}</strong></p>` : ""}
+    ${it.english ? `<p style="margin:4px 0"><span class="muted small">Keep:</span> <strong>${sayable(it.english)}</strong></p>` : ""}
     ${opts}${sug && sug.tip ? `<p class="small muted">${esc(sug.tip)}</p>` : ""}
     <div class="row" style="margin-top:6px"></div><p class="err small" data-err></p>`;
   const row = $(".row", el);
@@ -539,7 +577,7 @@ async function setupUses(root, detail) {
   if (!uses.length) return;
   const said = uses.filter((u) => u.used).length;
   box.innerHTML = `<h3>Phrases you aimed for</h3><p class="muted small">${said} of ${uses.length} found in the transcript. The check looks for the words in order and ignores fillers, so a different wording of the same idea is not counted.</p>` +
-    uses.map((u) => `<div class="card"><div class="tag">${u.used ? "said" : "not said"}</div> <strong>${esc(u.english)}</strong>${u.used ? `<p class="small muted" style="margin:4px 0">Heard: “${esc(u.matched)}”</p>` : ""}${u.used ? `<div class="row"><button class="secondary" data-fluent="${u.item_id}">Counts as a fluent review</button></div>` : ""}</div>`).join("");
+    uses.map((u) => `<div class="card"><div class="tag">${u.used ? "said" : "not said"}</div> <strong>${sayable(u.english)}</strong>${u.used ? `<p class="small muted" style="margin:4px 0">Heard: “${esc(u.matched)}”</p>` : ""}${u.used ? `<div class="row"><button class="secondary" data-fluent="${u.item_id}">Counts as a fluent review</button></div>` : ""}</div>`).join("");
   box.querySelectorAll("[data-fluent]").forEach((b) => b.addEventListener("click", async () => {
     b.disabled = true;
     try { await api(`/api/notebook/${b.dataset.fluent}/review`, { method: "POST", body: { result: "fluent" } }); b.textContent = "Recorded"; logEvent("use_counted_fluent", { item: Number(b.dataset.fluent) }, detail.id); }
@@ -592,7 +630,7 @@ async function setupGaps(root, detail) {
 function renderPatterns(box, p) {
   if (!p.patterns.length) { box.innerHTML = ""; return; }
   const f = p.focus;
-  const ex = (t) => t.examples.slice(-1).map((e) => `<div class="small" style="margin:4px 0 0 12px"><span class="muted">You said:</span> “${esc(e.said)}” <span class="muted">Better:</span> “${esc(e.better)}”</div>`).join("");
+  const ex = (t) => t.examples.slice(-1).map((e) => `<div class="small" style="margin:4px 0 0 12px"><span class="muted">You said:</span> “${esc(e.said)}” <span class="muted">Better:</span> “${sayable(e.better)}”</div>`).join("");
   box.innerHTML = `<h3 style="margin-top:0">What keeps coming back</h3>
     ${f ? `<div class="card due"><div class="tag">Focus for now</div><p style="margin:4px 0"><strong>${esc(f.tag)}</strong>: ${esc(f.issue)}</p><p class="small muted" style="margin:0">Raised in ${f.recent_sessions} of your last sessions.</p>${ex(f)}</div>` : `<p class="muted small">No pattern has come up in two recent sessions yet.</p>`}
     <div class="card scroll"><table><thead><tr><th>Pattern</th><th class="num">Sessions</th><th>Last seen</th></tr></thead><tbody>${p.patterns.slice(0, 8).map((t) => `<tr><td><strong>${esc(t.tag)}</strong><div class="small muted">${esc(t.issue)}</div></td><td class="num">${t.sessions}</td><td>${esc(t.last_seen)}</td></tr>`).join("")}</tbody></table></div>
@@ -624,7 +662,7 @@ async function renderNotebook() {
         ${it.context ? `<p class="small muted">Around: “${esc(it.context)}”</p>` : ""}
         <div id="rv-answer"><button class="primary" id="rv-show">Show the English</button></div></div>`;
       $("#rv-show").addEventListener("click", () => {
-        $("#rv-answer").innerHTML = `<p style="font-size:18px;margin:6px 0"><strong>${esc(it.english)}</strong></p><p class="small muted">Be honest. How did it go?</p><div class="row"><button class="primary" data-r="fluent">Said it without stopping</button><button class="secondary" data-r="hesitated">Hesitated</button><button class="secondary" data-r="failed">Could not say it</button></div>`;
+        $("#rv-answer").innerHTML = `<p style="font-size:18px;margin:6px 0"><strong>${sayable(it.english)}</strong></p><p class="small muted">Be honest. How did it go?</p><div class="row"><button class="primary" data-r="fluent">Said it without stopping</button><button class="secondary" data-r="hesitated">Hesitated</button><button class="secondary" data-r="failed">Could not say it</button></div>`;
         dueBox.querySelectorAll("button[data-r]").forEach((b) => b.addEventListener("click", async () => {
           await api(`/api/notebook/${it.id}/review`, { method: "POST", body: { result: b.dataset.r } });
           logEvent("notebook_review", { item: it.id, result: b.dataset.r });
@@ -641,7 +679,7 @@ async function renderNotebook() {
     list.forEach((it) => {
       const el = it.status === "new" ? itemCard(it, () => renderNotebook()) : (() => {
         const d = document.createElement("div"); d.className = "card";
-        d.innerHTML = `<div class="tag">${esc(it.status)} · ${it.reviews} review(s)${it.due_at ? ` · next ${esc(it.due_at.slice(0, 10))}` : ""}</div><p style="margin:4px 0"><span class="muted small">${esc(it.intent)}</span><br><strong>${esc(it.english)}</strong></p>`;
+        d.innerHTML = `<div class="tag">${esc(it.status)} · ${it.reviews} review(s)${it.due_at ? ` · next ${esc(it.due_at.slice(0, 10))}` : ""}</div><p style="margin:4px 0"><span class="muted small">${esc(it.intent)}</span><br><strong>${sayable(it.english)}</strong></p>`;
         return d;
       })();
       allBox.appendChild(el);
@@ -664,10 +702,10 @@ function renderPron(box, r, detail) {
   const sm = r.summary;
   const tiles = SCORE_LABELS.filter(([k]) => sm.scores[k] != null).map(([k, label]) => `<div class="chip ${scoreClass(sm.scores[k])}" style="margin-right:6px"><strong>${Math.round(sm.scores[k])}</strong> ${label}</div>`).join("");
   const sounds = (ph) => ph.map((p) => `<span class="chip ${scoreClass(p.s)}" style="padding:0 6px;margin-right:3px">${esc(p.p)} ${Math.round(p.s)}</span>`).join("");
-  const words = sm.worst_words.map((w, i) => `<div class="small" style="margin:6px 0"><strong>${esc(w.word)}</strong> <span class="muted">${Math.round(w.score)}${w.times > 1 ? ` · weak ${w.times} times` : ""}</span>
+  const words = sm.worst_words.map((w, i) => `<div class="small" style="margin:6px 0"><strong>${sayable(w.word)}</strong> <span class="muted">${Math.round(w.score)}${w.times > 1 ? ` · weak ${w.times} times` : ""}</span>
       ${w.unit === "s" ? ` <button class="secondary play" data-t="${w.t}" style="padding:0 8px">Listen</button>` : ""}<br>${sounds(w.sounds)}</div>`).join("");
-  const weak = sm.weak_sounds.map((x) => `<li class="small"><strong>/${esc(x.sound)}/</strong> <span class="muted">average ${Math.round(x.mean)} in ${x.count} words${x.words.length ? `, for example ${x.words.map(esc).join(", ")}` : ""}</span></li>`).join("");
-  const earClips = r.ear ? r.ear.clips.map((c) => `<div class="small" style="margin:6px 0"><strong>${esc(c.word)}</strong> <span class="muted">sounds like</span> ${esc(c.heard)}<br>${esc(c.issue)}${c.fix ? `<br><span class="muted">Try:</span> ${esc(c.fix)}` : ""}</div>`).join("") : "";
+  const weak = sm.weak_sounds.map((x) => `<li class="small"><strong>/${esc(x.sound)}/</strong> <span class="muted">average ${Math.round(x.mean)} in ${x.count} words${x.words.length ? `, for example ${x.words.map((w) => sayable(w)).join(", ")}` : ""}</span></li>`).join("");
+  const earClips = r.ear ? r.ear.clips.map((c) => `<div class="small" style="margin:6px 0"><strong>${sayable(c.word)}</strong> <span class="muted">sounds like</span> ${esc(c.heard)}<br>${sayQuoted(c.issue)}${c.fix ? `<br><span class="muted">Try:</span> ${sayQuoted(c.fix)}` : ""}</div>`).join("") : "";
   const ear = r.ear ? `<p class="small muted" style="margin:10px 0 0">What an audio model heard when it listened to those words (${esc(r.ear.model)}):</p>${earClips}${r.ear.overall ? `<p class="small">${esc(r.ear.overall)}</p>` : ""}<p class="small muted">An AI model listening is less reliable than the scores above and can be wrong about a word. Trust a tip only if you can hear it yourself with “Listen”.</p>`
     : r.ear_pending ? `<p class="small muted" style="margin:10px 0 0">An audio model is listening to the weakest words…</p>` : "";
   box.innerHTML = `<h3>Pronunciation</h3>
@@ -720,7 +758,7 @@ function renderCoaching(body, c) {
     <p>${esc(k.summary)}</p>
     ${k.strengths.length ? `<p class="small"><strong>What worked.</strong> ${k.strengths.map(esc).join(" ")}</p>` : ""}
     ${k.patterns.map((p) => `<div class="card"><div class="tag">${esc(p.tag)}</div><p style="margin:4px 0">${esc(p.issue)}</p>${p.why ? `<p class="small muted" style="margin:0 0 4px">${esc(p.why)}</p>` : ""}${examples(p)}</div>`).join("")}
-    ${k.phrases.length ? `<h3 style="margin-top:14px">Phrases to reuse</h3><ul>${k.phrases.map((ph, i) => `<li class="small"><strong>${esc(ph.phrase)}</strong>${ph.use ? ` <span class="muted">${esc(ph.use)}</span>` : ""} <button class="secondary keep" data-i="${i}" style="padding:0 8px">Keep</button></li>`).join("")}</ul>` : ""}
+    ${k.phrases.length ? `<h3 style="margin-top:14px">Phrases to reuse</h3><ul>${k.phrases.map((ph, i) => `<li class="small"><strong>${sayable(ph.phrase)}</strong>${ph.use ? ` <span class="muted">${esc(ph.use)}</span>` : ""} <button class="secondary keep" data-i="${i}" style="padding:0 8px">Keep</button></li>`).join("")}</ul>` : ""}
     ${k.focus_next ? `<div class="card due"><div class="tag">Next time, one thing</div><p style="margin:4px 0 0">${esc(k.focus_next)}</p></div>` : ""}
     <p class="small muted">From ${esc(c.provider)} (${esc(c.model)}). A language model reads an automatic transcript, which tends to correct what you said. It can miss pronunciation and grammar slips that only the audio shows, so “no mistake found” does not mean there was none${c.provider === "mock" ? ". This one is a placeholder." : "."}</p>`;
 }
@@ -1128,7 +1166,7 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
       for (;;) {
         if (queue.length) {
           const sn = queue.shift();
-          if (!bubble) bubble = add("partner", ""); text = (text + " " + sn.text).trim(); bubble.textContent = text; say.scrollTop = say.scrollHeight;
+          if (!bubble) bubble = add("partner", ""); text = (text + " " + sn.text).trim(); bubble.textContent = text; bubble.dataset.say = text; bubble.title = "Click to hear it again"; say.scrollTop = say.scrollHeight;
           note.textContent = sn.audio_url ? "" : (sn.voice_note || "");
           playing = true;
           if (sn.audio_url) await playUrl(sn.audio_url, () => { note.textContent = "Your browser blocked the sound. Click anywhere, then it works."; }, cur);

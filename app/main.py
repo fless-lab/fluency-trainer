@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import os
 import time
@@ -677,6 +678,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except TTSError as exc:
             events.write("tts.error", sid, idx=idx, part=part, error=str(exc))
             return {"part": part, "text": text, "audio_url": None, "voice_note": str(exc)}
+
+    # say anything: the voice of the app on demand, cached on disk ---------------------------------------
+    say_dir = data / "say"
+    say_dir.mkdir(parents=True, exist_ok=True)
+    say_locks: dict[str, asyncio.Lock] = {}
+    SAY_MAX_CHARS = 300
+
+    @app.get("/api/say")
+    async def say(text: str) -> FileResponse:
+        """Spoken audio of a word or a sentence, for the click-to-hear buttons. The same text is paid for once."""
+        text = " ".join(text.split())
+        if not text:
+            raise HTTPException(422, "nothing to say")
+        if len(text) > SAY_MAX_CHARS:
+            raise HTTPException(422, f"too long to say ({SAY_MAX_CHARS} characters at most)")
+        if tts is None:
+            raise HTTPException(503, tts_error or "No voice configured")
+        key = hashlib.sha1(f"{tts.name}|{tts.model}|{getattr(tts, 'voice', '')}|{text}".encode()).hexdigest()
+        headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+        for f in say_dir.glob(f"{key}.*"):
+            return FileResponse(f, headers=headers)
+        async with say_locks.setdefault(key, asyncio.Lock()):
+            for f in say_dir.glob(f"{key}.*"):  # made by another request while this one waited
+                return FileResponse(f, headers=headers)
+            if db.tts_characters_since(day_ago()) + len(text) > settings.tts_max_chars_per_day:
+                events.write("tts.cap_reached", None, cap=settings.tts_max_chars_per_day)
+                raise HTTPException(429, f"Daily voice cap reached (TTS_MAX_CHARS_PER_DAY={settings.tts_max_chars_per_day}).")
+            try:
+                started = time.monotonic()
+                r = await tts.speak(text)
+            except TTSError as exc:
+                events.write("tts.error", None, error=str(exc), say=True)
+                raise HTTPException(502, str(exc)) from exc
+            ext = ".mp3" if "mpeg" in r.mime else ".wav" if "wav" in r.mime else ".bin"
+            path = say_dir / f"{key}{ext}"
+            tmp = path.with_suffix(ext + ".part")
+            tmp.write_bytes(r.audio)
+            os.replace(tmp, path)
+            db.log_tts_call(None, r.provider, r.model, r.characters)
+            events.write("say.made", None, characters=r.characters, seconds=round(time.monotonic() - started, 2))
+        return FileResponse(path, headers=headers)
 
     def chat_prompt(sid: str, s: dict[str, Any], opening: bool) -> str:
         scenario = s["topic_text"] or "A relaxed, friendly chat."

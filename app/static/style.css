@@ -241,3 +241,14 @@ body.calm .confetti { display: none; }
 .seg button { border: 0; border-radius: 0; background: transparent; box-shadow: none; padding: 7px 14px; font-weight: 700; color: var(--ink); cursor: pointer; }
 .seg button.on { background: var(--yellow); color: #1d1b38; }
 @media (prefers-reduced-motion: reduce) { .pill .dot { animation: none; } }
+
+/* click to hear */
+.say { cursor: pointer; border-bottom: 2px dotted currentColor; border-radius: 3px; transition: background .12s; }
+.say::after { content: "\1F50A"; font-size: .72em; margin-left: 3px; opacity: 0; transition: opacity .12s; }
+.say:hover, .say:focus-visible { background: var(--yellow); color: #1d1b38; outline: none; }
+.say:hover::after, .say:focus-visible::after, .say.saying::after { opacity: 1; }
+.say.saying { animation: sayPulse .9s ease-in-out infinite; }
+.say-partner[data-say] { cursor: pointer; }
+.say-partner[data-say]:hover { filter: brightness(.96); }
+@keyframes sayPulse { 50% { background: var(--yellow); color: #1d1b38; } }
+@media (prefers-reduced-motion: reduce) { .say.saying { animation: none; background: var(--yellow); color: #1d1b38; } }
