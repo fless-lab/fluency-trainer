@@ -23,10 +23,10 @@
 <body>
   <main>
     <h1>Fluency Trainer</h1>
-    <p>This app is protected. Enter the password to continue.</p>
+    <p>This app is private. Enter your access code, or the owner's password.</p>
     <form id="f">
-      <label for="pw" style="display:none">Password</label>
-      <input id="pw" type="password" autocomplete="current-password" placeholder="Password" autofocus required>
+      <label for="pw" style="display:none">Access code or password</label>
+      <input id="pw" type="password" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Access code or password" autofocus required>
       <button id="go" type="submit">Open</button>
       <div id="err" role="alert"></div>
     </form>

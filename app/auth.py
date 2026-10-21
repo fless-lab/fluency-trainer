@@ -73,25 +73,31 @@ def load_secret(path: Path, rotate: bool = False) -> bytes:
 
 
 class Tokens:
+    """A login cookie names who it is for and carries a version number. The version is changed when that person's code is
+    renewed or they are blocked, which makes every cookie they had stop working without touching anyone else's."""
+
     def __init__(self, secret: bytes):
         self.secret = secret
 
     def _sig(self, payload: str) -> str:
         return _b64(hmac.new(self.secret, payload.encode(), hashlib.sha256).digest())
 
-    def issue(self, now: float | None = None) -> str:
+    def issue(self, uid: str, version: int = 1, now: float | None = None) -> str:
         expires = int((now or time.time()) + SESSION_DAYS * 86400)
-        payload = f"{expires}.{secrets.token_urlsafe(12)}"
+        payload = f"{uid}.{version}.{expires}.{secrets.token_urlsafe(12)}"
         return f"{payload}.{self._sig(payload)}"
 
-    def valid(self, token: str | None, now: float | None = None) -> bool:
+    def read(self, token: str | None, now: float | None = None) -> tuple[str, int] | None:
+        """(who, version) when the cookie is genuine and not expired, else None. The caller checks the version is still current."""
         if not token:
-            return False
+            return None
         try:
-            expires, nonce, sig = token.split(".")
-            return hmac.compare_digest(sig, self._sig(f"{expires}.{nonce}")) and int(expires) > (now or time.time())
+            uid, version, expires, nonce, sig = token.split(".")
+            if hmac.compare_digest(sig, self._sig(f"{uid}.{version}.{expires}.{nonce}")) and int(expires) > (now or time.time()):
+                return uid, int(version)
         except ValueError:
-            return False
+            pass
+        return None
 
 
 class RateLimiter:

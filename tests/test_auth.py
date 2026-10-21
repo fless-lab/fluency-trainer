@@ -21,12 +21,13 @@ def test_password_is_hashed_checked_and_weak_ones_refused():
 
 def test_tokens_cannot_be_forged_or_used_after_they_expire_or_after_the_secret_changes():
     t = auth.Tokens(b"k" * 32)
-    tok = t.issue(now=1000.0)
-    assert t.valid(tok, now=1000.0 + 60)
-    assert not t.valid(tok, now=1000.0 + auth.SESSION_DAYS * 86400 + 5)
-    exp, nonce, sig = tok.split(".")
-    assert not t.valid(f"{int(exp) + 99999}.{nonce}.{sig}") and not t.valid("") and not t.valid(None) and not t.valid("a.b")
-    assert not auth.Tokens(b"z" * 32).valid(tok, now=1000.0 + 60)  # a new secret logs everybody out
+    tok = t.issue("u1a2b3c4", 3, now=1000.0)
+    assert t.read(tok, now=1000.0 + 60) == ("u1a2b3c4", 3)  # who it is for, and which version
+    assert t.read(tok, now=1000.0 + auth.SESSION_DAYS * 86400 + 5) is None
+    uid, ver, exp, nonce, sig = tok.split(".")
+    for forged in (f"admin.{ver}.{exp}.{nonce}.{sig}", f"{uid}.{int(ver) + 1}.{exp}.{nonce}.{sig}", f"{uid}.{ver}.{int(exp) + 99999}.{nonce}.{sig}", "", "a.b"):
+        assert t.read(forged) is None  # changing who it is for, its version or its expiry breaks the signature
+    assert t.read(None) is None and auth.Tokens(b"z" * 32).read(tok, now=1000.0 + 60) is None
 
 
 def test_secret_file_is_private_and_rotating_changes_it(tmp_path):
@@ -57,14 +58,16 @@ def make(tmp_path, password=None, host="127.0.0.1"):
 def test_without_a_password_the_app_is_open_as_before(tmp_path):
     with TestClient(make(tmp_path)) as c:
         assert c.get("/api/state").status_code == 200 and c.get("/").status_code == 200
-        assert c.get("/api/auth/status").json() == {"enabled": False, "authed": True}
+        st = c.get("/api/auth/status").json()
+        assert st["enabled"] is False and st["authed"] is True
 
 
 def test_with_a_password_nothing_is_reachable_until_login(tmp_path):
     with TestClient(make(tmp_path, "a calm river at dawn")) as c:
         assert c.get("/api/state").status_code == 401 and c.get("/api/export").status_code == 401
         assert "password" in c.get("/").text.lower() and 'id="pw"' in c.get("/").text  # the page is the login form
-        assert c.get("/api/auth/status").json() == {"enabled": True, "authed": False}
+        st = c.get("/api/auth/status").json()
+        assert st["enabled"] is True and st["authed"] is False
         bad = c.post("/api/login", json={"password": "wrong wrong wrong"})
         assert bad.status_code == 401 and "ft_session" not in bad.headers.get("set-cookie", "")
         good = c.post("/api/login", json={"password": "a calm river at dawn"})

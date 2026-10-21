@@ -199,7 +199,7 @@ async function refreshState() {
   else banner.hidden = true;
 }
 
-const TABS = { today: renderToday, notebook: renderNotebook, history: renderHistory, progress: renderProgress, data: renderData, settings: renderSettings };
+const TABS = { today: renderToday, notebook: renderNotebook, history: renderHistory, progress: renderProgress, data: renderData, settings: renderSettings, people: renderPeople, me: renderMe };
 let currentTab = "today";
 async function show(tab) {
   currentTab = tab;
@@ -995,6 +995,112 @@ async function pronunciationProgressHtml() {
     <p class="small muted">A guide, not a verdict: a score also depends on the recording, the topic and how fast you spoke, so small changes mean little.</p>`;
 }
 
+// ---------------------------------------------------------------- people (the owner) and me (everyone)
+let ME = null;
+async function loadMe() {
+  try { ME = await api("/api/me"); } catch (_) { return; }
+  document.querySelectorAll("#tabs [data-admin]").forEach((b) => { b.hidden = !ME.is_admin; });
+  if (ME.needs_consent) consentScreen();
+}
+
+function consentScreen() {
+  const box = openOverlay(`<h2>Welcome, ${esc(ME.name)}</h2>
+    <p>This is a private test, run by the person who invited you. Before you start, please read this:</p>
+    <ul>
+      <li>Your voice recordings, their transcripts and your results are stored on that person's computer, in a space that is only yours inside the app. The person who runs it can see how much you use the app and the feedback you send, and could in principle open your files.</li>
+      <li>Your voice is sent to services that process it: speech recognition, pronunciation scoring, and a language model that writes the feedback.</li>
+      <li>You can download everything of yours, or delete it all, at any time from the <strong>Me</strong> tab.</li>
+    </ul>
+    <p class="small muted">Do not say anything you would not want the person running this to be able to hear.</p>
+    <div class="row"><button class="primary" id="consent-ok">I understand, continue</button><button class="secondary" id="consent-out">No, log me out</button></div>`);
+  $("#consent-ok", box).addEventListener("click", async () => { await api("/api/me/consent", { method: "POST" }); ME.needs_consent = false; closeOverlay(); });
+  $("#consent-out", box).addEventListener("click", async () => { await fetch("/api/logout", { method: "POST" }); location.href = "/login"; });
+}
+
+async function renderMe() {
+  if (!ME) await loadMe();
+  const admin = ME.is_admin;
+  view.innerHTML = `<h2>Me</h2><p class="lead">${esc(ME.name)}${admin ? " · owner" : ""}</p>
+    ${admin ? `<div class="card"><p class="small" style="margin:0">You are the owner. Your first language and the keys are in <a href="#" id="to-settings">Settings</a>; invited people are in <a href="#" id="to-people">People</a>.</p></div>` : `
+    <div class="card"><h3>Profile</h3>
+      <div style="margin:8px 0"><label for="me-name"><strong>Your name</strong></label><br><input type="text" id="me-name" value="${esc(ME.name)}" size="30" maxlength="60"></div>
+      <div style="margin:8px 0"><label for="me-lang"><strong>Your first language</strong></label><br><input type="text" id="me-lang" value="${esc(ME.native_language)}" placeholder="for example French" size="30" maxlength="40"><div class="small muted">In English. The pronunciation lessons compare English sounds with it.</div></div>
+      <div class="row"><button class="primary" id="me-save">Save</button><span class="small muted" id="me-msg"></span></div></div>`}
+    <div class="card"><h3>Tell me what you think</h3><p class="small muted" style="margin-top:0">Something confusing, something broken, something you would like? Write it here, it goes straight to the person who runs this.</p>
+      <textarea id="fb-text" rows="4" style="width:100%" placeholder="What happened, and what did you expect?" maxlength="3000"></textarea>
+      <div class="row" style="margin-top:8px"><button class="primary" id="fb-send">Send</button><span class="small muted" id="fb-msg"></span></div></div>
+    <div class="card"><h3>Your data</h3><div class="row"><a class="secondary" href="/api/me/export" download>Download everything of mine (zip)</a>${admin ? "" : `<button class="secondary" id="me-delete">Delete my account and all my data</button>`}${ME.multi_user || !admin ? `<button class="secondary" id="me-logout">Log out</button>` : ""}</div></div>`;
+  const toS = $("#to-settings"); if (toS) toS.addEventListener("click", (e) => { e.preventDefault(); show("settings"); });
+  const toP = $("#to-people"); if (toP) toP.addEventListener("click", (e) => { e.preventDefault(); show("people"); });
+  const save = $("#me-save");
+  if (save) save.addEventListener("click", async () => {
+    try { const r = await api("/api/me/profile", { method: "POST", body: { name: $("#me-name").value, native_language: $("#me-lang").value } }); ME.name = r.name; ME.native_language = r.native_language; $("#me-msg").textContent = "Saved."; }
+    catch (e) { $("#me-msg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+  });
+  $("#fb-send").addEventListener("click", async () => {
+    const text = $("#fb-text").value.trim();
+    if (!text) return;
+    try { await api("/api/feedback", { method: "POST", body: { text, page: currentTab } }); $("#fb-text").value = ""; $("#fb-msg").textContent = "Sent. Thank you."; }
+    catch (e) { $("#fb-msg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+  });
+  const del = $("#me-delete");
+  if (del) del.addEventListener("click", async () => {
+    const typed = prompt(`This deletes all your recordings and results for good. Type your name (${ME.name}) to confirm:`);
+    if (typed === null) return;
+    try { await api(`/api/me?confirm=${encodeURIComponent(typed)}`, { method: "DELETE" }); location.href = "/login"; } catch (e) { alert(e.message); }
+  });
+  const out = $("#me-logout"); if (out) out.addEventListener("click", async () => { await fetch("/api/logout", { method: "POST" }); location.href = "/login"; });
+}
+
+const fmtMin = (sec) => (sec ? `${(sec / 60).toFixed(1)} min` : "0");
+async function renderPeople() {
+  if (!ME) await loadMe();
+  let r, fb;
+  try { r = await api("/api/users"); fb = await api("/api/feedback"); }
+  catch (e) { view.innerHTML = `<h2>People</h2><p class="err">${esc(e.message)}</p>`; return; }
+  const row = (p) => {
+    const u = p.usage || {};
+    return `<tr><td><strong>${esc(p.name)}</strong>${p.note ? `<div class="small muted">${esc(p.note)}</div>` : ""}${p.disabled ? ` <span class="chip bad">blocked</span>` : ""}${p.consent_at ? "" : ` <span class="chip mid" title="has not accepted the welcome notice yet">not started</span>`}</td>
+      <td class="small">${esc((p.last_login || "never").replace("T", " ").slice(0, 16))}</td>
+      <td class="num">${u.done ?? 0}</td><td class="small">${esc((u.last_session || "").slice(0, 10) || "–")}</td>
+      <td class="small">${u.llm_calls_7d ?? 0} model calls<br>${(u.tts_chars_7d ?? 0).toLocaleString()} voice chars<br>${fmtMin(u.usage_7d && u.usage_7d.stt_seconds)} transcribed<br>${fmtMin(u.usage_7d && u.usage_7d.pron_seconds)} scored</td>
+      <td><button class="secondary mini" data-renew="${esc(p.id)}" data-name="${esc(p.name)}">New code</button> <button class="secondary mini" data-block="${esc(p.id)}" data-state="${p.disabled ? 0 : 1}">${p.disabled ? "Unblock" : "Block"}</button> <button class="secondary mini" data-del="${esc(p.id)}" data-name="${esc(p.name)}">Delete</button></td></tr>`;
+  };
+  const fbHtml = fb.items.slice(0, 40).map((f) => `<div class="card" style="margin:8px 0"><div class="small muted"><strong>${esc(f.name)}</strong> · ${esc(f.page || "")} · ${esc(f.ts.replace("T", " ").slice(0, 16))}</div><p style="margin:4px 0;white-space:pre-wrap">${esc(f.text)}</p></div>`).join("");
+  const ownerU = r.owner.usage;
+  view.innerHTML = `<h2>People</h2><p class="lead">Invite people to try the app. Each one has a space of their own: you see how much they use it, never someone else's recordings from here.</p>
+    <div id="code-box"></div>
+    <div class="card"><h3>Invite someone</h3><div class="row"><input type="text" id="np-name" placeholder="Their first name" maxlength="60" size="22"><input type="text" id="np-note" placeholder="Note for you (optional)" maxlength="200" size="30"><button class="primary" id="np-add">Create their code</button><span class="small err" id="np-err"></span></div>
+      <p class="small muted">The code is shown once, and the app keeps only a scrambled version: if it is lost, make a new one. It is long enough that nobody can guess it, and wrong tries are limited. To use the app away from this computer, follow <code>docs/remote-access.md</code>.</p></div>
+    <h3>Who is using it (last 7 days)</h3>
+    <div class="card scroll"><table><thead><tr><th>Person</th><th>Last login</th><th>Sessions</th><th>Last session</th><th>Used</th><th></th></tr></thead><tbody>
+      <tr><td><strong>You</strong> <span class="small muted">(owner)</span></td><td></td><td class="num">${ownerU.done}</td><td class="small">${esc((ownerU.last_session || "").slice(0, 10) || "–")}</td><td class="small">${ownerU.llm_calls_7d} model calls<br>${ownerU.tts_chars_7d.toLocaleString()} voice chars<br>${fmtMin(ownerU.usage_7d.stt_seconds)} transcribed<br>${fmtMin(ownerU.usage_7d.pron_seconds)} scored</td><td></td></tr>
+      ${r.people.map(row).join("")}</tbody></table></div>
+    <p class="small muted">These are the quantities you are charged for. Everyone shares your keys, so it all comes out of your credit. A limit per person can be added later.</p>
+    <h3>Feedback from testers</h3>${fbHtml || `<p class="small muted">Nothing yet.</p>`}`;
+  const showCode = (name, code) => {
+    const msg = `Hi ${name}, here is your access to Fluency Trainer.\nOpen ${location.origin}\nEnter this code: ${code}`;
+    $("#code-box").innerHTML = `<div class="card due"><div class="tag">Code for ${esc(name)} · shown once</div><p style="font-size:26px;font-weight:800;letter-spacing:.04em;margin:6px 0">${esc(code)}</p><textarea id="invite-text" rows="3" style="width:100%" readonly>${esc(msg)}</textarea><div class="row" style="margin-top:8px"><button class="primary" id="copy-invite">Copy the message</button><span class="small muted" id="copy-msg"></span></div>${location.hostname === "localhost" || location.hostname === "127.0.0.1" ? `<p class="small err">This address only works on this computer. For another device, set up remote access first (docs/remote-access.md), then send them that address.</p>` : ""}</div>`;
+    $("#copy-invite").addEventListener("click", async () => { try { await navigator.clipboard.writeText(msg); $("#copy-msg").textContent = "Copied."; } catch (_) { $("#invite-text").select(); $("#copy-msg").textContent = "Select and copy it."; } });
+    window.scrollTo(0, 0);
+  };
+  $("#np-add").addEventListener("click", async () => {
+    $("#np-err").textContent = "";
+    try { const out = await api("/api/users", { method: "POST", body: { name: $("#np-name").value, note: $("#np-note").value } }); logEvent("person_invited"); await renderPeople(); showCode(out.user.name, out.code); }
+    catch (e) { $("#np-err").textContent = e.message; }
+  });
+  view.querySelectorAll("[data-renew]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm(`Make a new code for ${b.dataset.name}? The old one stops working and they are logged out.`)) return;
+    const out = await api(`/api/users/${b.dataset.renew}/renew`, { method: "POST" }); showCode(b.dataset.name, out.code);
+  }));
+  view.querySelectorAll("[data-block]").forEach((b) => b.addEventListener("click", async () => { await api(`/api/users/${b.dataset.block}/block`, { method: "POST", body: { blocked: b.dataset.state === "1" } }); renderPeople(); }));
+  view.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", async () => {
+    const typed = prompt(`This deletes ${b.dataset.name} and ALL their recordings and results for good. Type their name to confirm:`);
+    if (typed === null) return;
+    try { await api(`/api/users/${b.dataset.del}?confirm=${encodeURIComponent(typed)}`, { method: "DELETE" }); renderPeople(); } catch (e) { alert(e.message); }
+  }));
+}
+
 // ---------------------------------------------------------------- settings
 const SETTINGS_CHECKS = { stt: [["stt", "Check the key"]], llm: [["llm", "Check feedback model"], ["chat", "Check conversation model"]], voice: [["voice", "Check the voice"]], pron: [["azure", "Check Azure"], ["audio", "Check audio model"]] };
 
@@ -1003,7 +1109,7 @@ async function renderAccess(box) {
   try { st = await api("/api/auth/status"); } catch (_) { return; }
   const secure = location.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
   box.innerHTML = `<details class="card fold" ${st.enabled ? "" : "open"}><summary><h3>Access</h3><span class="small muted">${st.enabled ? "protected by a password" : "this computer only, no password"}</span></summary>
-    <p class="muted small" style="margin-top:0">By default only this computer can open the app. To use it from another device (an iPad, for example) it needs a password, and the connection must be https, or the browser will refuse the microphone. The steps are in <code>docs/remote-access.md</code>. The password is stored only as a salted hash, and the app refuses to listen on the network without one.</p>
+    <p class="muted small" style="margin-top:0">By default only this computer can open the app. To use it from another device (an iPad, for example) it needs a password, and the connection must be https, or the browser will refuse the microphone. The steps are in <code>docs/remote-access.md</code>. The password is stored only as a salted hash, and the app refuses to listen on the network without a password or invited people. People you invite log in with their own code (see the People tab): this password is yours.</p>
     ${secure ? "" : `<p class="err small">You are on an unencrypted connection (${esc(location.protocol)}//${esc(location.host)}): do not type a password here.</p>`}
     <div style="margin:10px 0"><label for="pw1"><strong>${st.enabled ? "New password" : "Password"}</strong></label><br><input type="password" id="pw1" autocomplete="new-password" size="34" placeholder="at least 12 characters"><div class="small muted">A short phrase of a few words is easier to remember than symbols.</div></div>
     <div style="margin:10px 0"><label for="pw2"><strong>Again</strong></label><br><input type="password" id="pw2" autocomplete="new-password" size="34"></div>
@@ -1165,6 +1271,7 @@ function checkSmoothness() {
   try { await refreshState(); } catch (e) { view.innerHTML = `<p class="err">Cannot reach the server: ${esc(e.message)}</p>`; return; }
   retryPending().catch(() => {});
   logEvent("page_loaded", { ua: navigator.userAgent });
+  await loadMe();
   show("today");
 })();
 

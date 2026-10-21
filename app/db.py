@@ -150,6 +150,11 @@ CREATE TABLE IF NOT EXISTS pronunciation (
     data TEXT NOT NULL,
     PRIMARY KEY (session_id, unit)
 );
+CREATE TABLE IF NOT EXISTS usage (
+    at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    amount REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_sessions_checkpoint ON sessions(checkpoint);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 """
@@ -398,6 +403,15 @@ class DB:
         with self.conn() as c:
             c.execute("INSERT INTO tts_calls (at, session_id, provider, model, characters) VALUES (?,?,?,?,?)",
                       (utcnow(), sid, provider, model, characters))
+
+    def log_usage(self, kind: str, amount: float) -> None:
+        """What a paid service was used for (seconds of audio transcribed or scored): the owner sees it per person."""
+        with self.conn() as c:
+            c.execute("INSERT INTO usage (at, kind, amount) VALUES (?,?,?)", (utcnow(), kind, float(amount)))
+
+    def usage_since(self, iso: str) -> dict[str, float]:
+        with self.conn() as c:
+            return {r["kind"]: round(r["total"], 1) for r in c.execute("SELECT kind, SUM(amount) AS total FROM usage WHERE at >= ? GROUP BY kind", (iso,)).fetchall()}
 
     def tts_characters_since(self, iso: str) -> int:
         with self.conn() as c:

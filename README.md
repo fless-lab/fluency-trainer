@@ -70,6 +70,10 @@ Limits to keep in mind: the model sees only the transcript, so on a short or unc
 
 Playful, colourful interface: cream paper with a dot grid, thick outlines, chunky buttons, a colour per tab, and a light or dark switch (top right, remembered in the browser). The Outfit font is bundled in `app/static/fonts` (SIL Open Font License, text included), so nothing is loaded from the internet. Decorative shapes and speech bubbles appear in the margins on wide screens only. Small animations (floating shapes, cards that pop in, confetti when a session or a review ends) are switched off when your device asks for reduced motion, and nothing moves during a recording. Every decorative shape floats gently. At load the app also measures its own frame rate for two seconds; below 45 frames per second it switches the decorative motion off ("calm" mode) and logs a `client.perf_check` event with the measured rate and browser, so you can see in the log where it was slow. Tested in Chromium only: Firefox and Safari were not available here.
 
+## People
+
+You can invite people to test the app (People tab): each gets a long personal code and a space of their own (own database, recordings, notebook, progress), kept apart from yours and from each other's. You see their usage, not their recordings; they send you feedback from a box in the app; they can download or delete all their data. Everyone uses your keys, so you pay; the usage table shows what each person used. Details, and what is not there yet, in `docs/people.md`.
+
 ## Using it from another device
 
 See `docs/remote-access.md`. In short: set a password in Settings, Access (the app refuses to listen on the network without one), reach the app over https (Tailscale is the simplest way), then on an iPad use Safari, Share, Add to Home Screen. It is checked and tested on a desktop browser only.

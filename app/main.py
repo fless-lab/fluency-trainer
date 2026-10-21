@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import shutil
+import tempfile
 import json
 import os
 import sys
@@ -19,6 +21,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 from . import APP_VERSION
@@ -36,6 +39,9 @@ from .config import ROOT, Settings, load_settings
 from . import settings_admin as sadm
 from . import backup as bk
 from . import auth
+from . import tenancy
+from . import users as us
+from .tenancy import CURRENT, DBProxy, EventsProxy, Tenants, UserPath
 from .db import DB
 from .eventlog import EventLog, utcnow
 from .metrics import METRICS_VERSION, compute_metrics
@@ -125,6 +131,25 @@ class PasswordIn(BaseModel):
     password: str | None = Field(default=None, max_length=500)
 
 
+class NewPerson(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    note: str = Field(default="", max_length=200)
+
+
+class BlockIn(BaseModel):
+    blocked: bool
+
+
+class ProfileIn(BaseModel):
+    name: str | None = Field(default=None, max_length=60)
+    native_language: str | None = Field(default=None, max_length=40)
+
+
+class FeedbackIn(BaseModel):
+    text: str = Field(min_length=1, max_length=3000)
+    page: str = Field(default="", max_length=80)
+
+
 class TargetsIn(BaseModel):
     item_ids: list[int] = Field(min_length=1, max_length=12)
     source: Literal["prep", "due"] = "due"
@@ -191,11 +216,10 @@ def local_today() -> Date:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
-    data = settings.data_dir
-    for sub in ("audio", "transcripts"):
-        (data / sub).mkdir(parents=True, exist_ok=True)
-    db = DB(data / "fluency.db")
-    events = EventLog(data / "events.jsonl")
+    root = settings.data_dir  # the owner's data lives here; invited people each have root/users/<id>
+    registry = us.Registry(root / "users.json")
+    tenants = Tenants(root, registry)
+    data, db, events = UserPath(), DBProxy(), EventsProxy(tenants.admin.events)  # resolved per request: see tenancy.py
     provider, provider_error = make_provider(settings)
     llm, llm_error = make_llm(settings)
     chat_llm, chat_error = (llm, llm_error)
@@ -216,6 +240,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             data = await pron.assess_audio(path, settings.azure_speech_key, settings.azure_speech_region,
                                            settings.pron_locale, pron_gate)
             db.save_pronunciation(sid, unit, data)
+            db.log_usage("pron_seconds", data["seconds"])
             pron_errors.pop(sid, None)
             events.write("pron.done", sid, unit=unit, seconds=round(time.monotonic() - started, 2),
                          audio_seconds=data["seconds"], chunks=len(data["chunks"]))
@@ -301,6 +326,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     audio_seconds=result.audio_seconds,
                     error=None if computed["values"] else f"No metrics computed: {', '.join(computed['flags'])}",
                 )
+                db.log_usage("stt_seconds", result.audio_seconds or s["client_seconds"] or 0)
                 events.write(
                     "process.done", sid, seconds=round(time.monotonic() - started, 2),
                     n_tokens=computed["n_tokens"], flags=computed["flags"],
@@ -314,11 +340,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         events.write("app.start", None, version=APP_VERSION, provider=settings.stt_provider, provider_error=provider_error,
                      metrics_version=METRICS_VERSION)
-        pending = db.list_sessions(status=("uploaded", "processing"))
         tasks = []
-        for s in pending:
-            events.write("process.recover", s["id"], previous_status=s["status"])
-            tasks.append(asyncio.create_task(process_session(s["id"])))
+        for ctx in tenants.everyone():  # work that was interrupted, for each person, in their own context
+            token = CURRENT.set(ctx)
+            try:
+                for s in db.list_sessions(status=("uploaded", "processing")):
+                    events.write("process.recover", s["id"], previous_status=s["status"])
+                    tasks.append(asyncio.create_task(process_session(s["id"])))
+            finally:
+                CURRENT.reset(token)
         app.state.tasks = tasks
         daily = asyncio.create_task(backup_daily())
         yield
@@ -326,28 +356,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         events.write("app.stop", None)
 
     app = FastAPI(title="Fluency Trainer", version=APP_VERSION, lifespan=lifespan)
-    app.state.db, app.state.events, app.state.settings = db, events, settings
+    app.state.db, app.state.events, app.state.settings = tenants.admin.db, tenants.admin.events, settings
+    app.state.tenants, app.state.registry = tenants, registry
     app.state.process_session = process_session
 
-    # access: open by default; with a password every request needs the cookie that a good login gives ---------------
+    # access ------------------------------------------------------------------------------------------------
+    # Open (as before) while there is no password and nobody invited. Once there is either, every request needs a login cookie
+    # that names who it is for; the owner at this very computer is let in without one only while no owner password is set.
     class AuthState:
         password_hash = settings.app_password_hash
-        tokens = auth.Tokens(auth.load_secret(data / "secret.key"))
+        tokens = auth.Tokens(auth.load_secret(root / "secret.key"))
         limiter = auth.RateLimiter()
     PUBLIC = {"/login", "/api/login", "/api/logout", "/api/auth/status"}
     UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
+    LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
     def client_key(request: Request) -> str:
         fwd = request.headers.get("x-forwarded-for", "")
         return fwd.split(",")[0].strip() or (request.client.host if request.client else "?")
 
-    def is_authed(request: Request) -> bool:
-        return not AuthState.password_hash or AuthState.tokens.valid(request.cookies.get(auth.COOKIE))
+    def direct_local(request: Request) -> bool:
+        """This very computer, not a proxy in front of it."""
+        return (request.client.host if request.client else "") in LOCAL_HOSTS and not auth.through_proxy(request.headers)
 
-    def set_cookie(response: Response, request: Request) -> None:
+    def auth_required() -> bool:
+        return bool(AuthState.password_hash) or registry.any_users()
+
+    def identify(request: Request):
+        """Who is making this request: a tenancy.Ctx, or None."""
+        if not auth_required():
+            return tenants.admin
+        got = AuthState.tokens.read(request.cookies.get(auth.COOKIE))
+        if got and registry.version(got[0]) == got[1]:
+            return tenants.for_user(got[0])
+        if not AuthState.password_hash and direct_local(request):
+            return tenants.admin
+        return None
+
+    def set_cookie(response: Response, request: Request, uid: str) -> None:
         secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
-        response.set_cookie(auth.COOKIE, AuthState.tokens.issue(), max_age=auth.SESSION_DAYS * 86400, httponly=True,
-                            samesite="lax", secure=secure, path="/")
+        response.set_cookie(auth.COOKIE, AuthState.tokens.issue(uid, registry.version(uid) or 1), max_age=auth.SESSION_DAYS * 86400,
+                            httponly=True, samesite="lax", secure=secure, path="/")
 
     @app.middleware("http")
     async def gate(request: Request, call_next):
@@ -358,11 +407,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 allowed = {request.headers.get("host", ""), request.headers.get("x-forwarded-host", "")}
                 if urlparse(origin).netloc not in allowed:
                     return JSONResponse({"detail": "cross-site request refused"}, status_code=403)
-        if path in PUBLIC or path.startswith("/static/") or is_authed(request):
+        who = identify(request)
+        request.state.user = who
+        if who is None and not (path in PUBLIC or path.startswith("/static/")):
+            if path.startswith("/api/"):
+                return JSONResponse({"detail": "login required"}, status_code=401)
+            return FileResponse(STATIC_DIR / "login.html", status_code=200)
+        token = CURRENT.set(who)  # from here on, db / data / events mean this person's
+        try:
             return await call_next(request)
-        if path.startswith("/api/"):
-            return JSONResponse({"detail": "login required"}, status_code=401)
-        return FileResponse(STATIC_DIR / "login.html", status_code=200)
+        finally:
+            CURRENT.reset(token)
 
     @app.middleware("http")
     async def audit(request: Request, call_next):
@@ -377,8 +432,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return response
         finally:
             if request.url.path.startswith("/api/"):
+                who = getattr(request.state, "user", None)
                 events.write("http", None, method=request.method, path=request.url.path, status=status,
-                             ms=round((time.monotonic() - started) * 1000, 1))
+                             ms=round((time.monotonic() - started) * 1000, 1), user=who.id if who else None)
 
     # helpers ---------------------------------------------------------------
     def need_session(sid: str) -> dict[str, Any]:
@@ -659,24 +715,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/auth/status")
     def auth_status(request: Request) -> dict[str, Any]:
-        return {"enabled": bool(AuthState.password_hash), "authed": is_authed(request)}
+        who = getattr(request.state, "user", None)
+        return {"enabled": auth_required(), "authed": who is not None, "owner_password": bool(AuthState.password_hash),
+                "people": len(registry.list())}
 
     @app.post("/api/login")
     def login(body: LoginIn, request: Request) -> Response:
+        """The owner's password or a person's invitation code, in the same box."""
         key = client_key(request)
         wait = AuthState.limiter.wait(key)
         if wait:
             events.write("auth.blocked", None, wait=wait)
-            return JSONResponse({"detail": f"Too many wrong passwords. Try again in {wait} s."}, status_code=429, headers={"Retry-After": str(wait)})
-        if AuthState.password_hash and not auth.verify_password(body.password, AuthState.password_hash):
+            return JSONResponse({"detail": f"Too many wrong tries. Try again in {wait} s."}, status_code=429, headers={"Retry-After": str(wait)})
+        if not auth_required():
+            return JSONResponse({"ok": True})
+        who = None
+        if AuthState.password_hash and auth.verify_password(body.password, AuthState.password_hash):
+            who = us.ADMIN
+        else:
+            person = registry.check_code(body.password)
+            who = person["id"] if person else None
+        if who is None:
             AuthState.limiter.failed(key)
             events.write("auth.failed", None)
-            return JSONResponse({"detail": "Wrong password."}, status_code=401)
+            return JSONResponse({"detail": "Wrong password or code."}, status_code=401)
         AuthState.limiter.ok(key)
-        response = JSONResponse({"ok": True})
-        if AuthState.password_hash:
-            set_cookie(response, request)
-            events.write("auth.login", None)
+        response = JSONResponse({"ok": True, "admin": who == us.ADMIN})
+        set_cookie(response, request, who)
+        events.write("auth.login", None, user=who)
         return response
 
     @app.post("/api/logout")
@@ -687,7 +753,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/auth/password")
     def set_password(body: PasswordIn, request: Request) -> Response:
-        """Set, change or remove the password. Only from this computer. Changing it logs every other browser out."""
+        """Set, change or remove the owner's password. Only from this computer. Every other browser of the owner is logged out."""
         local_only(request)
         if body.password:
             weak = auth.check_strength(body.password)
@@ -698,15 +764,147 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             new_hash = ""
         sadm.write_env(env_path, {"APP_PASSWORD_HASH": new_hash})
         AuthState.password_hash = new_hash
-        AuthState.tokens = auth.Tokens(auth.load_secret(data / "secret.key", rotate=True))
+        registry.bump_admin()  # the owner's old cookies stop working; invited people are not affected
         events.write("auth.password_changed", None, enabled=bool(new_hash))
         response = JSONResponse({"enabled": bool(new_hash)})
-        if new_hash:
-            set_cookie(response, request)  # this browser stays logged in
+        if new_hash or registry.any_users():
+            set_cookie(response, request, us.ADMIN)  # this browser stays logged in
+        return response
+
+    # people: the owner invites them, each has their own data -------------------------------------------------
+    feedback_file = root / "feedback.jsonl"
+
+    def iso_ago(days: float) -> str:
+        return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="milliseconds")
+
+    def usage_of(ctx: tenancy.Ctx) -> dict[str, Any]:
+        sessions = ctx.db.list_sessions()
+        d7, d30 = iso_ago(7), iso_ago(30)
+        return {"sessions": len(sessions), "done": sum(1 for x in sessions if x["status"] == "done"),
+                "last_session": sessions[0]["created_at"] if sessions else None,
+                "llm_calls_7d": ctx.db.count_llm_calls_since(d7), "tts_chars_7d": ctx.db.tts_characters_since(d7),
+                "usage_7d": ctx.db.usage_since(d7), "usage_30d": ctx.db.usage_since(d30)}
+
+    @app.get("/api/users")
+    def users_list(request: Request) -> dict[str, Any]:
+        local_only(request)
+        people = []
+        for person in registry.list():
+            ctx = tenants.for_user(person["id"]) if not person.get("disabled") else None
+            people.append({**person, "usage": usage_of(ctx) if ctx else None})
+        return {"owner": {"name": "You", "usage": usage_of(tenants.admin)}, "people": people}
+
+    @app.post("/api/users", status_code=201)
+    def users_add(body: NewPerson, request: Request) -> dict[str, Any]:
+        """Invite someone. The code is returned this once and is never stored: only its hash is."""
+        local_only(request)
+        try:
+            person, code = registry.create(body.name, body.note)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        tenants.for_user(person["id"])  # makes their folder and database
+        events.write("users.added", None, user=person["id"])
+        return {"user": person, "code": code}
+
+    @app.post("/api/users/{uid}/renew")
+    def users_renew(uid: str, request: Request) -> dict[str, Any]:
+        local_only(request)
+        try:
+            code = registry.renew_code(uid)
+        except KeyError:
+            raise HTTPException(404, "no such person") from None
+        events.write("users.code_renewed", None, user=uid)
+        return {"code": code}
+
+    @app.post("/api/users/{uid}/block")
+    def users_block(uid: str, body: BlockIn, request: Request) -> dict[str, Any]:
+        local_only(request)
+        try:
+            registry.set_disabled(uid, body.blocked)
+        except KeyError:
+            raise HTTPException(404, "no such person") from None
+        events.write("users.blocked" if body.blocked else "users.unblocked", None, user=uid)
+        return {"blocked": body.blocked}
+
+    @app.delete("/api/users/{uid}")
+    def users_delete(uid: str, request: Request, confirm: str = "") -> dict[str, Any]:
+        """Remove a person and everything of theirs. The name must be typed, so it cannot be done by a slip."""
+        local_only(request)
+        person = registry.get(uid)
+        if not person:
+            raise HTTPException(404, "no such person")
+        if confirm.strip() != person["name"]:
+            raise HTTPException(422, "Type the person's name to confirm: this deletes all their recordings and results.")
+        registry.delete(uid)
+        tenants.erase(uid)
+        tenants.admin.events.write("users.deleted", None, user=uid)
+        return {"deleted": True}
+
+    @app.get("/api/feedback")
+    def feedback_list(request: Request) -> dict[str, Any]:
+        local_only(request)
+        lines = feedback_file.read_text(encoding="utf-8").splitlines()[-200:] if feedback_file.is_file() else []
+        return {"items": [json.loads(x) for x in reversed(lines)]}
+
+    @app.get("/api/me")
+    def me(request: Request) -> dict[str, Any]:
+        who = request.state.user
+        person = None if who.is_admin else registry.get(who.id)
+        return {"id": who.id, "name": who.name, "is_admin": who.is_admin,
+                "native_language": settings.native_language if who.is_admin else who.native_language,
+                "needs_consent": bool(person and not person.get("consent_at")), "multi_user": registry.any_users()}
+
+    @app.post("/api/me/profile")
+    def me_profile(body: ProfileIn, request: Request) -> dict[str, Any]:
+        who = request.state.user
+        if who.is_admin:
+            raise HTTPException(409, "The owner's first language is set in Settings.")
+        fields = {k: v for k, v in (("name", body.name), ("native_language", body.native_language)) if v is not None and v.strip()}
+        person = registry.update(who.id, **fields)
+        return {"name": person["name"], "native_language": person["native_language"]}
+
+    @app.post("/api/me/consent")
+    def me_consent(request: Request) -> dict[str, Any]:
+        who = request.state.user
+        if not who.is_admin:
+            registry.update(who.id, consent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        return {"ok": True}
+
+    @app.post("/api/feedback", status_code=201)
+    def feedback_add(body: FeedbackIn, request: Request) -> dict[str, Any]:
+        """A note from a tester to the owner, kept with who sent it and where."""
+        who = request.state.user
+        entry = {"ts": utcnow(), "user": who.id, "name": who.name, "page": body.page, "text": body.text.strip(), "app": APP_VERSION}
+        with feedback_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        events.write("feedback.sent", None, chars=len(entry["text"]), page=body.page)
+        return {"ok": True}
+
+    @app.get("/api/me/export")
+    async def me_export(request: Request) -> FileResponse:
+        """Everything of the person's own, as one zip: their database, transcripts and recordings."""
+        who = request.state.user
+        tmp = Path(tempfile.mkdtemp()) / f"my-data-{who.id}.zip"
+        await asyncio.to_thread(bk.make_backup, who.dir, tmp, True, APP_VERSION, False)
+        return FileResponse(tmp, media_type="application/zip", filename=f"fluency-data-{who.name.replace(' ', '_')}.zip",
+                            background=BackgroundTask(shutil.rmtree, tmp.parent, True))
+
+    @app.delete("/api/me")
+    def me_delete(request: Request, confirm: str = "") -> Response:
+        who = request.state.user
+        if who.is_admin:
+            raise HTTPException(409, "The owner's data is not deleted from here.")
+        if confirm.strip() != who.name:
+            raise HTTPException(422, "Type your name to confirm: this deletes all your recordings and results.")
+        registry.delete(who.id)
+        tenants.erase(who.id)
+        tenants.admin.events.write("users.self_deleted", None, user=who.id)  # not in their own log: it was just erased
+        response = JSONResponse({"deleted": True})
+        response.delete_cookie(auth.COOKIE, path="/")
         return response
 
     # backups -----------------------------------------------------------------------------------------
-    backup_dir = data / "backups"
+    backup_dir = root / "backups"
 
     @app.get("/api/backups")
     def backups_list(request: Request) -> dict[str, Any]:
@@ -718,7 +916,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Make a backup now: light (database, transcripts, log) or full (with your recordings too)."""
         local_only(request)
         name = f"backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}{'' if full else '-light'}.zip"
-        info = await asyncio.to_thread(bk.make_backup, data, backup_dir / name, full, APP_VERSION)
+        info = await asyncio.to_thread(bk.make_backup, root, backup_dir / name, full, APP_VERSION)
         events.write("backup.made", None, kind=info["kind"], files=info["files"], size=info["size"], manual=True)
         return {"name": name, "size": info["size"], "kind": info["kind"], "files": info["files"]}
 
@@ -736,7 +934,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 if bk.automatic_due(backup_dir):
                     name = f"auto-{datetime.now().strftime('%Y%m%d')}.zip"
-                    info = await asyncio.to_thread(bk.make_backup, data, backup_dir / name, False, APP_VERSION)
+                    info = await asyncio.to_thread(bk.make_backup, root, backup_dir / name, False, APP_VERSION)
                     removed = bk.prune_automatic(backup_dir)
                     events.write("backup.made", None, kind="light", files=info["files"], size=info["size"], manual=False, pruned=len(removed))
             except Exception as exc:  # noqa: BLE001 - a failed backup must never stop the app
@@ -745,12 +943,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # settings screen -------------------------------------------------------------------------------
     env_path = ROOT / ".env"
-    LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
     def local_only(request: Request) -> None:
-        """The settings hold keys and can restart the app: only the machine it runs on may use them."""
-        if (request.client.host if request.client else "") not in LOCAL_HOSTS or auth.through_proxy(request.headers):
-            raise HTTPException(403, "The settings can only be changed from the computer the app runs on.")
+        """Keys, backups, restarting and the list of people: only the owner, and only at this computer (never through a proxy)."""
+        who = getattr(request.state, "user", None)
+        if who is None or not who.is_admin or not direct_local(request):
+            raise HTTPException(403, "This can only be done by the owner, from the computer the app runs on.")
 
     @app.get("/api/settings")
     def get_settings(request: Request) -> dict[str, Any]:
@@ -880,7 +1078,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if db.count_coaching_since(since) + db.count_llm_calls_since(since, exclude="chat") >= settings.coach_max_per_day:
                 raise HTTPException(429, f"Daily cap of {settings.coach_max_per_day} feedback requests reached (COACH_MAX_PER_DAY).")
             summary = pron.aggregate(units)
-            system, user = lesson_messages(summary, s.get("transcript_text") or "", settings.native_language)
+            system, user = lesson_messages(summary, s.get("transcript_text") or "", tenancy.current().native_language or settings.native_language)
             db.log_llm_call("lesson", sid)
             started = time.monotonic()
             try:
@@ -969,7 +1167,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # voice conversation -----------------------------------------------------
     conv_dir = data / "conv"
-    conv_dir.mkdir(parents=True, exist_ok=True)
     conv_locks: dict[str, asyncio.Lock] = {}
     conv_tasks: dict[str, list[asyncio.Task]] = {}
 
@@ -1004,7 +1201,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"part": part, "text": text, "audio_url": None, "voice_note": str(exc)}
 
     # say anything: the voice of the app on demand, cached on disk ---------------------------------------
-    say_dir = data / "say"
+    say_dir = root / "say"  # the same word is the same sound for everybody: shared, and made once
     say_dir.mkdir(parents=True, exist_ok=True)
     say_locks: dict[str, asyncio.Lock] = {}
     SAY_MAX_CHARS = 300
@@ -1212,6 +1409,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async with semaphore:
                 result = await provider.transcribe(path, mime, seconds)
             if result.words:
+                db.log_usage("stt_seconds", seconds)
                 db.set_turn_words(sid, idx, result.words, result.text)
             events.write("conv.batch_stt", sid, idx=idx, words=len(result.words))
         except Exception as exc:  # noqa: BLE001

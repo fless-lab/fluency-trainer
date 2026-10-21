@@ -3,7 +3,7 @@
 By default the app only listens on this computer (`127.0.0.1`): nobody else can reach it. To use it from an iPad you need two
 things, and the app insists on both.
 
-1. **A password.** Without one the app refuses to listen on the network.
+1. **A password or invited people.** Without either, the app refuses to listen on the network. (To let other people in, see `docs/people.md`.)
 2. **https.** A browser only gives the microphone to a secure page. Over plain `http://192.168.x.x` the microphone is refused.
 
 Your keys, recordings and transcripts stay on the computer that runs the app. The iPad is only a screen and a microphone.
