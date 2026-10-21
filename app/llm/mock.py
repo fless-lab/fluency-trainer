@@ -24,6 +24,12 @@ class MockLLM:
             answer = {"options": [{"english": "Mock: " + (im.group(1).strip() if im else ""), "note": "Placeholder, not real advice."}],
                       "tip": ""}
             return LLMResult("mock", "mock", json.dumps(answer), {"input_tokens": 0, "output_tokens": 0})
+        if "pronunciation teacher" in system:
+            words = re.findall(r'^- "([^"]+)" scored', user, re.M)
+            lesson = {"focus": [{"sound": "θ", "label": "the th in think", "explain": "Mock lesson: a placeholder, not real advice.",
+                                 "how": "Put your tongue between your teeth.", "pairs": [["think", "sink"]], "your_words": words[:2],
+                                 "sentences": ["I think so.", "Thank you.", "Three things."]}], "advice": "Mock: practise once a day."}
+            return LLMResult("mock", "mock", json.dumps(lesson), {"input_tokens": 0, "output_tokens": 0})
         m = re.search(r"<transcript>\n(.*?)\n</transcript>", user, re.S)
         text = re.sub(r"\[(?:pause|unsure) [^\]]*\]", " ", m.group(1) if m else "")  # whole markers out, never cut in half
         words = text.split()

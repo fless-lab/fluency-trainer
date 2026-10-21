@@ -156,3 +156,36 @@ def test_a_word_is_cut_out_of_the_persons_own_recording(tmp_path, monkeypatch):
         assert r.status_code == 200 and abs(w.getnframes() / w.getframerate() - 1.0) < 0.01  # 0.2 s before, the word, 0.3 s after
         assert c.get(f"/api/sessions/{sid}/clip", params={"unit": "7", "t": 1.0}).status_code == 404
         assert c.get(f"/api/sessions/{sid}/clip", params={"unit": "s", "t": 99.0}).status_code == 404
+
+
+def test_lesson_is_checked_against_the_measured_words_and_the_sounds_are_given_as_symbols():
+    from app import lesson as ls
+    summary = pr.aggregate([{"seconds": 3.0, "unit": "s", "chunks": [pr.summarize_chunk(_azure([
+        ("children", 50, [("ch", 40), ("ih", 90)]), ("joining", 46, [("jh", 36)]), ("vision", 30, [("zh", 20)])]), 0.0)]}])
+    system, user = ls.build_messages(summary, "My children went to school. It was a good time.", "French")
+    assert "first language is French" in system and "/tʃ/ (40)" in user and 'They said: "My children went to school."' in user
+    raw = ('{"focus":[{"sound":"tʃ","label":"ch","explain":"e","how":"h","pairs":[["chip","ship"],["bad"]],'
+           '"your_words":["children","invented"],"sentences":["a","b","c","d"]}],"advice":"a"}')
+    out = ls.parse_lesson("Here: " + raw, summary)["focus"][0]
+    assert out["your_words"] == ["children"] and out["pairs"] == [["chip", "ship"]] and len(out["sentences"]) == 3
+    assert out["clips"][0]["word"] == "children"
+
+
+def test_lesson_route_makes_stores_and_reuses_the_lesson(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.config import Settings
+    from app.main import create_app
+    from tests.test_api import record
+    async def fake_assess(path, key, region, locale, gate=None):
+        return {"seconds": 3.0, "chunks": [{**pr.summarize_chunk(_azure([("children", 50, [("ch", 40)]), ("vision", 30, [("zh", 20)])]), 0.0), "seconds": 3.0}]}
+    monkeypatch.setattr(pr, "assess_audio", fake_assess)
+    s = Settings(data_dir=tmp_path / "data", stt_provider="mock", assemblyai_key="", assemblyai_models=(), max_upload_bytes=1024 * 1024,
+                 host="127.0.0.1", port=0, llm_provider="mock", azure_speech_key="k", azure_speech_region="norwayeast")
+    with TestClient(create_app(s)) as c:
+        sid = record(c)
+        assert _wait(c, sid, "done")["state"] == "done"
+        assert c.get(f"/api/sessions/{sid}/pronunciation/lesson").json() == {"lesson": None}
+        first = c.post(f"/api/sessions/{sid}/pronunciation/lesson").json()
+        assert first["reused"] is False and first["lesson"]["focus"][0]["your_words"] == ["vision", "children"]
+        again = c.post(f"/api/sessions/{sid}/pronunciation/lesson").json()
+        assert again["reused"] is True and c.get(f"/api/sessions/{sid}/pronunciation/lesson").json()["lesson"] == first["lesson"]

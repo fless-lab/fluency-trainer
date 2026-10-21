@@ -77,6 +77,13 @@ Playful, colourful interface: cream paper with a dot grid, thick outlines, chunk
 - **You can interrupt (off by default).** Tick the box on the start card, then talk over the partner, or press "Interrupt" (always there), and it stops and listens. Use headphones: with speakers the partner's own voice comes back into the microphone, and an earlier version cut the partner off by mistake. Now you have to be clearly louder than that echo, measured while it plays. The "talk over it" case was only tested with a recording, not a live voice.
 - The Auto end-of-turn logic was tested for connection and with a simulated microphone, not with a real person talking: tune it with the "patient / natural / quick" choice.
 
+## Hearing it
+
+- **Click to hear.** Words and phrases with a dotted underline can be clicked (a small speaker appears on hover): the words in the pronunciation lists, the lesson, the "Better:" examples and phrases in the feedback, the expressions in your notebook, and what the partner said. The app's voice makes each text once (`/api/say`, saved in `data/say`), so a word you hear again is instant and free. If the voice is not set up or the daily cap (`TTS_MAX_CHARS_PER_DAY`) is reached, the browser voice is used.
+- **Model and You.** Every weak word has two buttons: the app's voice, and yourself, cut out of your own recording at that word. Compare them with your ear.
+- **Short words and half words are left out** of the lists to work on. Small words are said in a weak form in fast English ("didn't" becomes "din"), and the first and last word of each piece of audio sent to Azure can be cut in two. The scores still count every word.
+- **Pronunciation lesson.** A button on the pronunciation card: the language model reads the measured weak sounds and words and writes a short lesson on one or two sounds, for a speaker of `NATIVE_LANGUAGE` (default French): what goes wrong, how to place the mouth and tongue, minimal pairs, and three practice sentences built from your own words and topics. About a cent. Every word it says comes from your session is checked against the measured list. The scores are measured; the explanation is a model's and can be wrong.
+
 ## Pronunciation from the audio
 
 A speech-to-text transcript tends to guess the word you meant, so it hides mispronunciations. This part scores the audio itself.

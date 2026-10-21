@@ -47,6 +47,7 @@ class Settings:
     pron_concurrency: int = 1
     audio_model: str = "google/gemini-3.1-flash-lite"
     audio_key: str = ""
+    native_language: str = "French"
 
 
 def load_settings() -> Settings:
@@ -83,6 +84,7 @@ def load_settings() -> Settings:
         azure_speech_region=os.environ.get("AZURE_SPEECH_REGION", "").strip().lower(),
         pron_locale=os.environ.get("PRONUNCIATION_LOCALE", "en-US").strip(),
         pron_concurrency=int(os.environ.get("PRONUNCIATION_CONCURRENCY", "1")),
+        native_language=os.environ.get("NATIVE_LANGUAGE", "French").strip() or "French",
         audio_model=os.environ.get("AUDIO_COACH_MODEL", "google/gemini-3.1-flash-lite").strip(),
         audio_key=os.environ.get("AUDIO_COACH_KEY", "").strip() or (
             os.environ.get("TTS_API_KEY", "").strip() or os.environ.get("LLM_API_KEY", "").strip()

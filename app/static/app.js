@@ -725,12 +725,54 @@ function renderPron(box, r, detail) {
     ${weak ? `<p class="small muted" style="margin:8px 0 0">Sounds that were weak most often:</p><ul>${weak}</ul>` : ""}
     ${ear}
     <p class="small muted">Scored from the audio by Azure Speech, not from the transcript, so it hears what you really said. It judges against a standard accent: a different accent is not an error, so treat the scores as a guide. ${sm.n_words} words, ${Math.round(sm.seconds)} s.</p>
+    <div id="lesson" style="margin-top:12px"></div>
     <button class="secondary" id="pron-again" style="margin-top:4px">Score again</button>`;
+  setupLesson($("#lesson", box), detail);
   if (r.ear_pending) setTimeout(() => { if (document.body.contains(box)) setupPron(box.parentElement, detail); }, 2500);
   $("#pron-again", box).addEventListener("click", async () => {
     try { await api(`/api/sessions/${detail.id}/pronunciation`, { method: "POST" }); } catch (_) {}
     setupPron(box.parentElement, detail);
   });
+}
+
+// A short lesson on one or two weak sounds, written from the measurements. Everything in it can be clicked to be heard.
+function renderLesson(box, L, detail) {
+  const clipBtn = (c) => `<button class="secondary mini" data-clip="/api/sessions/${esc(detail.id)}/clip?unit=${encodeURIComponent(c.unit)}&t=${c.t}&d=${c.d || 1}" title="Hear yourself say it">You</button>`;
+  const focus = L.focus.map((f) => `<div class="card">
+      <div class="tag">/${esc(f.sound)}/ · ${esc(f.label)}</div>
+      <p style="margin:6px 0">${sayQuoted(f.explain)}</p>
+      ${f.how ? `<p class="small" style="margin:6px 0"><strong>How:</strong> ${sayQuoted(f.how)}</p>` : ""}
+      ${f.pairs.length ? `<p class="small" style="margin:6px 0"><span class="muted">Hear the difference:</span> ${f.pairs.map(([a, b]) => `${sayable(a)} / ${sayable(b)}`).join(" &nbsp;·&nbsp; ")}</p>` : ""}
+      ${f.clips.length ? `<p class="small" style="margin:6px 0"><span class="muted">Your words:</span> ${f.clips.map((c) => `${sayable(c.word)} ${clipBtn(c)}`).join(" &nbsp; ")}</p>` : ""}
+      ${f.sentences.length ? `<p class="small muted" style="margin:8px 0 2px">Say these out loud (click to hear them first):</p><ul style="margin:0">${f.sentences.map((x) => `<li class="small">${sayable(x)}</li>`).join("")}</ul>` : ""}
+    </div>`).join("");
+  box.innerHTML = `<h3>Your lesson</h3>${focus}${L.advice ? `<div class="card due"><div class="tag">This week</div><p style="margin:4px 0 0">${esc(L.advice)}</p></div>` : ""}
+    <p class="small muted">Written by a language model from the scores above, for a speaker of your first language. The scores are measured; the explanation can be wrong, so trust your own ear first.</p>
+    <button class="secondary" id="lesson-again">Make a new lesson (uses credits)</button>`;
+  $("#lesson-again", box).addEventListener("click", () => makeLesson(box, detail, true));
+}
+
+async function makeLesson(box, detail, regenerate) {
+  box.innerHTML = `<p class="muted small">Writing your lesson…</p>`;
+  try {
+    const r = await api(`/api/sessions/${detail.id}/pronunciation/lesson${regenerate ? "?regenerate=true" : ""}`, { method: "POST" });
+    logEvent("lesson_shown", { regenerate }, detail.id);
+    renderLesson(box, r.lesson, detail);
+  } catch (e) {
+    box.innerHTML = `<p class="err small">Could not make the lesson: ${esc(e.message)}</p><button class="secondary" id="lesson-retry">Try again</button>`;
+    $("#lesson-retry", box).addEventListener("click", () => makeLesson(box, detail, regenerate));
+  }
+}
+
+async function setupLesson(box, detail) {
+  if (!box) return;
+  if (!STATE || !STATE.llm) { try { await refreshState(); } catch (_) {} }
+  let have = null;
+  try { have = (await api(`/api/sessions/${detail.id}/pronunciation/lesson`, {})).lesson; } catch (_) {}
+  if (have) { renderLesson(box, have, detail); return; }
+  if (!(STATE && STATE.llm && STATE.llm.configured)) return;
+  box.innerHTML = `<button class="primary" id="lesson-go">Make my pronunciation lesson</button> <span class="small muted">One or two sounds to work on, with exercises built from your own words. About a cent.</span>`;
+  $("#lesson-go", box).addEventListener("click", () => makeLesson(box, detail, false));
 }
 
 async function setupPron(root, detail) {

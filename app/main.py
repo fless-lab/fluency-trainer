@@ -27,6 +27,7 @@ from .tts.base import TTSError
 from .tts.mock import MockTTS
 from .tts.openai_compat import OpenAICompatTTS
 from .notebook import find_use, KINDS, RESULTS, build_suggest_messages, clean, context_around, now_iso, parse_suggestions, schedule_after
+from .lesson import LESSON_VERSION, build_messages as lesson_messages, parse_lesson
 from .coach import COACH_VERSION, MIN_WORDS, annotate_transcript, build_messages, parse_feedback
 from .config import Settings, load_settings
 from .db import DB
@@ -594,6 +595,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not seg:
             raise HTTPException(404, "nothing at that time")
         return Response(pron.to_wav(seg), media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/sessions/{sid}/pronunciation/lesson")
+    def get_lesson(sid: str) -> dict[str, Any]:
+        need_session(sid)
+        raw = db.get_setting(f"lesson:{sid}")
+        lesson = json.loads(raw) if raw else None
+        return {"lesson": lesson if lesson and lesson.get("version") == LESSON_VERSION else None}
+
+    @app.post("/api/sessions/{sid}/pronunciation/lesson")
+    async def make_lesson(sid: str, regenerate: bool = False) -> dict[str, Any]:
+        """A short lesson on one or two weak sounds, written by the language model from the measured scores."""
+        s = need_session(sid)
+        if llm is None:
+            raise HTTPException(503, llm_error or "No language model configured")
+        lock = coach_locks.setdefault(f"lesson{sid}", asyncio.Lock())
+        if lock.locked():
+            raise HTTPException(409, "the lesson is already being made")
+        async with lock:
+            if not regenerate:
+                have = get_lesson(sid)["lesson"]
+                if have:
+                    return {"lesson": have, "reused": True}
+            await wait_pron(sid, 25)
+            units = azure_units(sid)
+            if not units:
+                raise HTTPException(409, "score the pronunciation first")
+            since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="milliseconds")
+            if db.count_coaching_since(since) + db.count_llm_calls_since(since, exclude="chat") >= settings.coach_max_per_day:
+                raise HTTPException(429, f"Daily cap of {settings.coach_max_per_day} feedback requests reached (COACH_MAX_PER_DAY).")
+            summary = pron.aggregate(units)
+            system, user = lesson_messages(summary, s.get("transcript_text") or "", settings.native_language)
+            db.log_llm_call("lesson", sid)
+            started = time.monotonic()
+            try:
+                result = await llm.complete(system, user, 2200)
+            except LLMError as exc:
+                events.write("lesson.error", sid, error=str(exc))
+                raise HTTPException(502, str(exc)) from exc
+            try:
+                lesson = parse_lesson(result.text, summary)
+            except ValueError as exc:
+                events.write("lesson.unusable", sid, error=str(exc), raw=result.text[:2000], usage=result.usage)
+                raise HTTPException(502, f"The model's answer could not be used ({exc}). Try again.") from exc
+            db.set_setting(f"lesson:{sid}", json.dumps(lesson, ensure_ascii=False))
+            events.write("lesson.done", sid, seconds=round(time.monotonic() - started, 2), model=result.model, usage=result.usage,
+                         sounds=[f["sound"] for f in lesson["focus"]])
+            return {"lesson": lesson, "reused": False}
 
     @app.post("/api/sessions/{sid}/pronunciation", status_code=202)
     async def run_pronunciation(sid: str) -> dict[str, Any]:  # async: it starts background tasks, which need the event loop
