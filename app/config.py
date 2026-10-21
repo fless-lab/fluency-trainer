@@ -41,6 +41,12 @@ class Settings:
     tts_base_url: str = ""
     tts_max_chars_per_day: int = 60000
     chat_max_per_day: int = 400
+    azure_speech_key: str = ""
+    azure_speech_region: str = ""
+    pron_locale: str = "en-US"
+    pron_concurrency: int = 1
+    audio_model: str = "google/gemini-3.1-flash-lite"
+    audio_key: str = ""
 
 
 def load_settings() -> Settings:
@@ -73,4 +79,12 @@ def load_settings() -> Settings:
         tts_base_url=os.environ.get("TTS_BASE_URL", "").strip(),
         chat_max_per_day=int(os.environ.get("CHAT_MAX_PER_DAY", "400")),
         tts_max_chars_per_day=int(os.environ.get("TTS_MAX_CHARS_PER_DAY", "60000")),
+        azure_speech_key=os.environ.get("AZURE_SPEECH_KEY", "").strip(),
+        azure_speech_region=os.environ.get("AZURE_SPEECH_REGION", "").strip().lower(),
+        pron_locale=os.environ.get("PRONUNCIATION_LOCALE", "en-US").strip(),
+        pron_concurrency=int(os.environ.get("PRONUNCIATION_CONCURRENCY", "1")),
+        audio_model=os.environ.get("AUDIO_COACH_MODEL", "google/gemini-3.1-flash-lite").strip(),
+        audio_key=os.environ.get("AUDIO_COACH_KEY", "").strip() or (
+            os.environ.get("TTS_API_KEY", "").strip() or os.environ.get("LLM_API_KEY", "").strip()
+            if "openrouter" in (os.environ.get("TTS_PROVIDER", "") + os.environ.get("LLM_PROVIDER", "")).lower() else ""),
     )

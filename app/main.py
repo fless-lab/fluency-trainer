@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import APP_VERSION
+from . import pronunciation as pron
 from .conversation import CONV_VERSION, SYSTEM as CONV_SYSTEM, delays, opening_prompt, reply_prompt, split_ready, stitch
 from .patterns import build_patterns
 from .tts.base import TTSError
@@ -182,6 +183,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     tts, tts_error = make_tts(settings)
     coach_locks: dict[str, asyncio.Lock] = {}
     semaphore = asyncio.Semaphore(2)
+    pron_on = bool(settings.azure_speech_key and settings.azure_speech_region)
+    pron_gate = asyncio.Semaphore(settings.pron_concurrency)
+    pron_tasks: dict[str, list[asyncio.Task]] = {}
+    pron_errors: dict[str, str] = {}
+
+    async def assess_unit(sid: str, unit: str, path: str) -> None:
+        """Score the pronunciation of one audio file with Azure. Runs in the background; a failure is only recorded."""
+        started = time.monotonic()
+        try:
+            data = await pron.assess_audio(path, settings.azure_speech_key, settings.azure_speech_region,
+                                           settings.pron_locale, pron_gate)
+            db.save_pronunciation(sid, unit, data)
+            pron_errors.pop(sid, None)
+            events.write("pron.done", sid, unit=unit, seconds=round(time.monotonic() - started, 2),
+                         audio_seconds=data["seconds"], chunks=len(data["chunks"]))
+        except Exception as exc:  # noqa: BLE001 - never let a scoring problem break a session
+            pron_errors[sid] = str(exc)[:300]
+            events.write("pron.error", sid, unit=unit, error=str(exc)[:500])
+
+    def queue_pron(sid: str, unit: str, path: str | None) -> None:
+        if pron_on and path:
+            pron_tasks.setdefault(sid, []).append(asyncio.create_task(assess_unit(sid, unit, str(path))))
+
+    ear_on = bool(pron_on and settings.audio_key and settings.audio_model)
+    ear_tasks: dict[str, asyncio.Task] = {}
+
+    def azure_units(sid: str) -> list[dict[str, Any]]:
+        return [u for u in db.get_pronunciation(sid) if u["unit"] != "ear"]
+
+    async def run_ear(sid: str) -> None:
+        """When the sounds are scored, let an audio model listen to the weakest words and say what it hears."""
+        started = time.monotonic()
+        try:
+            await wait_pron(sid, 180)
+            units = azure_units(sid)
+            if not units:
+                return
+            summary = pron.aggregate(units)
+            clips = pron.pick_clips(summary)
+            if not clips:
+                return
+            paths = dict(pron_sources(db.get_session(sid)))
+            pcm = {u: await asyncio.to_thread(pron.decode_pcm16k, paths[u]) for u in {c["unit"] for c in clips} if u in paths}
+            clips = [c for c in clips if c["unit"] in pcm]
+            ear = await pron.listen(clips, pcm, settings.audio_key, settings.audio_model)
+            db.save_pronunciation(sid, "ear", ear)
+            events.write("pron.ear", sid, seconds=round(time.monotonic() - started, 2), model=settings.audio_model, clips=len(ear["clips"]))
+        except Exception as exc:  # noqa: BLE001
+            events.write("pron.ear_error", sid, error=str(exc)[:500])
+
+    def queue_ear(sid: str) -> None:
+        if ear_on and not (sid in ear_tasks and not ear_tasks[sid].done()):
+            ear_tasks[sid] = asyncio.create_task(run_ear(sid))
+
+    async def wait_pron(sid: str, timeout: float) -> None:
+        pending = [t for t in pron_tasks.get(sid, []) if not t.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
 
     async def process_session(sid: str) -> None:
         async with semaphore:
@@ -408,6 +467,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                           client_seconds=duration_s, status="uploaded")
         events.write("upload.saved", sid, bytes=size, mime=base_mime, client_seconds=duration_s)
         background.add_task(process_session, sid)
+        queue_pron(sid, "s", str(final))  # scored at the same time as the transcription, not after it
+        queue_ear(sid)
         return {"id": sid, "status": "uploaded", "bytes": size}
 
     @app.get("/api/sessions")
@@ -493,6 +554,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         need_session(sid)
         return {"coaching": db.latest_coaching(sid, COACH_VERSION)}
 
+    def pron_sources(s: dict[str, Any]) -> list[tuple[str, str]]:
+        if s["kind"] == "conversation":
+            return [(str(t["idx"]), t["audio_path"]) for t in db.get_turns(s["id"])
+                    if t["role"] == "user" and t["audio_path"] and Path(t["audio_path"]).is_file()]
+        if s["audio_path"] and Path(s["audio_path"]).is_file():
+            return [("s", s["audio_path"])]
+        return []
+
+    @app.get("/api/sessions/{sid}/pronunciation")
+    def get_pronunciation(sid: str) -> dict[str, Any]:
+        s = need_session(sid)
+        units = azure_units(sid)
+        ear = next((u for u in db.get_pronunciation(sid) if u["unit"] == "ear"), None)
+        pending = any(not t.done() for t in pron_tasks.get(sid, []))
+        state = ("off" if not pron_on else "pending" if pending else "done" if units
+                 else "error" if sid in pron_errors else "none" if pron_sources(s) else "no_audio")
+        return {"state": state, "summary": pron.aggregate(units) if units else None, "error": pron_errors.get(sid),
+                "ear": ear, "ear_pending": bool(ear_on and not ear and sid in ear_tasks and not ear_tasks[sid].done())}
+
+    @app.post("/api/sessions/{sid}/pronunciation", status_code=202)
+    def run_pronunciation(sid: str) -> dict[str, Any]:
+        s = need_session(sid)
+        if not pron_on:
+            raise HTTPException(503, "Pronunciation scoring needs AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in .env.")
+        if any(not t.done() for t in pron_tasks.get(sid, [])):
+            return {"state": "pending"}
+        sources = pron_sources(s)
+        if not sources:
+            raise HTTPException(409, "this session has no audio to score")
+        db.clear_pronunciation(sid)
+        pron_errors.pop(sid, None)
+        pron_tasks[sid] = []
+        for unit, path in sources:
+            queue_pron(sid, unit, path)
+        queue_ear(sid)
+        return {"state": "pending"}
+
     @app.post("/api/sessions/{sid}/coach")
     async def make_coaching(sid: str, regenerate: bool = False) -> dict[str, Any]:
         s = need_session(sid)
@@ -518,7 +616,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if tr and tr.get("words"):
                 annotated = annotate_transcript(tr["words"], compute_metrics(tr["words"])["pauses"])
             known = build_patterns(db.latest_coaching_per_session())["known_tags"]
-            system, user = build_messages(s, db.metrics_for(sid, METRICS_VERSION), s["transcript_text"], annotated, known)
+            await wait_pron(sid, 25)  # usually finished long before: it starts as soon as the audio is transcribed
+            if sid in ear_tasks:
+                await asyncio.wait([ear_tasks[sid]], timeout=15)
+            units = azure_units(sid)
+            ear = next((u for u in db.get_pronunciation(sid) if u["unit"] == "ear"), None)
+            pron_text = "\n".join(x for x in (pron.for_coach(pron.aggregate(units)) if units else "", pron.ear_for_coach(ear)) if x)
+            system, user = build_messages(s, db.metrics_for(sid, METRICS_VERSION), s["transcript_text"], annotated, known,
+                                          pronunciation=pron_text)
             events.write("coach.start", sid, provider=llm.name, model=llm.model, version=COACH_VERSION)
             started = time.monotonic()
             try:
@@ -783,6 +888,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     yield json.dumps({"type": "empty"}) + "\n"
                 return StreamingResponse(empty(), media_type="application/x-ndjson")
         user_idx = db.add_turn(sid, "user", text, words=words, audio_path=str(path), latency_ms=latency_ms, speech_ms=int(duration_s * 1000))
+        queue_pron(sid, str(user_idx), str(path))  # scored while the transcript and the reply are being made
         if words is None:  # the timed words come later, in the background
             conv_tasks.setdefault(sid, []).append(asyncio.create_task(batch_words(sid, user_idx, path, base_mime, duration_s)))
         if db.get_session(sid)["status"] == "created":
@@ -825,6 +931,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         computed = compute_metrics(words)
         if computed["values"]:
             db.save_metrics(sid, METRICS_VERSION, computed["values"])
+        queue_ear(sid)
         d = delays(turns)
         missing = sum(1 for t in turns if t["role"] == "user" and not t["words"])
         db.update_session(sid, status="done", provider="conversation", transcript_path=str(transcript_path),

@@ -162,6 +162,8 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .transcript .w.sel { background: var(--yellow); color: #1d1b38; outline: 2px solid var(--ink); }
 .chip { display: inline-block; font-size: 11px; font-weight: 700; padding: 0 6px; margin: 0 3px; border-radius: 8px; border: 2px solid; vertical-align: middle; line-height: 17px; font-variant-numeric: tabular-nums; background: var(--surface); }
 .chip.mid { color: var(--mid); border-color: var(--mid); }
+.chip.ok { color: var(--good); border-color: var(--good); }
+.chip.bad { color: var(--bad); border-color: var(--bad); }
 .chip.boundary { color: var(--boundary); border-color: var(--boundary); }
 .chip.long { color: var(--long); border-color: var(--long); }
 .filler { text-decoration: underline wavy var(--mid); }

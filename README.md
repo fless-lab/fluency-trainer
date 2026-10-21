@@ -70,6 +70,16 @@ Limits to keep in mind: the model sees only the transcript, so on a short or unc
 
 Playful, colourful interface: cream paper with a dot grid, thick outlines, chunky buttons, a colour per tab, and a light or dark switch (top right, remembered in the browser). The Outfit font is bundled in `app/static/fonts` (SIL Open Font License, text included), so nothing is loaded from the internet. Decorative shapes and speech bubbles appear in the margins on wide screens only. Small animations (floating shapes, cards that pop in, confetti when a session or a review ends) are switched off when your device asks for reduced motion, and nothing moves during a recording. Every decorative shape floats gently. At load the app also measures its own frame rate for two seconds; below 45 frames per second it switches the decorative motion off ("calm" mode) and logs a `client.perf_check` event with the measured rate and browser, so you can see in the log where it was slow. Tested in Chromium only: Firefox and Safari were not available here.
 
+## Pronunciation from the audio
+
+A speech-to-text transcript tends to guess the word you meant, so it hides mispronunciations. This part scores the audio itself.
+
+- **Azure Speech** (pronunciation assessment, no script needed) scores every word and every sound, plus flow and intonation. Set `AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION` in `.env`. The free tier (F0) is enough: about 5 hours of audio a month.
+- **An audio model** (default `google/gemini-3.1-flash-lite` through OpenRouter, `AUDIO_COACH_MODEL`) then listens to a few short clips around your weakest words and says what it hears and how to fix it. It reuses your OpenRouter key. It is less reliable than the scores and can be wrong, and the screen says so.
+- Scoring starts as soon as the audio is saved, in the background, at the same time as the transcription; in a conversation each of your turns is scored while the partner answers. Expect about 35 s for 2 minutes of solo audio on the free tier, which handles one request at a time (`PRONUNCIATION_CONCURRENCY`, raise it on a paid tier). The session page fills in by itself.
+- The feedback model receives the measured scores and the audio model's notes, so its pronunciation advice comes from the audio. Without them it is told it cannot judge pronunciation from text.
+- Scores compare you to a standard accent: a different accent is not an error.
+
 ## Tests
 
 ```
@@ -78,4 +88,4 @@ python -m pytest -q
 
 ## Next
 
-Recurring error patterns across sessions, a pre-speaking box for the words you expect to need, and then a conversation partner with patient turn-taking.
+Trends in the pronunciation scores across sessions.

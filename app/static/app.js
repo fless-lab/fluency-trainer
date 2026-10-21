@@ -474,13 +474,15 @@ function renderSessionDetail(container, detail) {
     <div class="card transcript" id="tr">${renderTranscript(detail)}</div>
     <div id="uses"></div>
     <div id="gaps"></div>
-    ${detail.has_audio ? `<audio controls preload="none" src="/api/sessions/${esc(detail.id)}/audio" style="width:100%"></audio>` : ""}
+    ${detail.has_audio ? `<audio id="sess-audio" controls preload="none" src="/api/sessions/${esc(detail.id)}/audio" style="width:100%"></audio>` : ""}
+    <div id="pron"></div>
     <div id="coach"></div>
     <h3>How did it feel?</h3>
     <div class="row"><select id="fb-rating"><option value="">Rating…</option>${[1, 2, 3, 4, 5].map((n) => `<option value="${n}" ${detail.self_rating === n ? "selected" : ""}>${n}${n === 1 ? " (very hard)" : n === 5 ? " (easy)" : ""}</option>`).join("")}</select></div>
     <textarea id="fb-notes" placeholder="Notes: what blocked you, words you could not find, anything you avoided saying">${esc(detail.notes || "")}</textarea>
     <div class="row" style="margin-top:8px"><button class="secondary" id="fb-save">Save notes</button><span id="fb-msg" class="muted small"></span></div>`;
   container.appendChild(wrap);
+  setupPron(wrap, detail);
   setupCoach(wrap, detail);
   setupUses(wrap, detail);
   setupGaps(wrap, detail);
@@ -652,6 +654,62 @@ async function renderNotebook() {
     try { await api("/api/notebook", { method: "POST", body: { kind: "phrase", intent, english: $("#nb-english").value.trim() || null } }); renderNotebook(); }
     catch (e) { $("#nb-err").textContent = e.message; }
   });
+}
+
+// ---------------------------------------------------------------- pronunciation scores from the audio
+const SCORE_LABELS = [["AccuracyScore", "Sounds"], ["FluencyScore", "Flow"], ["ProsodyScore", "Intonation"]];
+const scoreClass = (v) => (v >= 80 ? "ok" : v >= 65 ? "mid" : "bad");
+
+function renderPron(box, r, detail) {
+  const sm = r.summary;
+  const tiles = SCORE_LABELS.filter(([k]) => sm.scores[k] != null).map(([k, label]) => `<div class="chip ${scoreClass(sm.scores[k])}" style="margin-right:6px"><strong>${Math.round(sm.scores[k])}</strong> ${label}</div>`).join("");
+  const sounds = (ph) => ph.map((p) => `<span class="chip ${scoreClass(p.s)}" style="padding:0 6px;margin-right:3px">${esc(p.p)} ${Math.round(p.s)}</span>`).join("");
+  const words = sm.worst_words.map((w, i) => `<div class="small" style="margin:6px 0"><strong>${esc(w.word)}</strong> <span class="muted">${Math.round(w.score)}${w.times > 1 ? ` · weak ${w.times} times` : ""}</span>
+      ${w.unit === "s" ? ` <button class="secondary play" data-t="${w.t}" style="padding:0 8px">Listen</button>` : ""}<br>${sounds(w.sounds)}</div>`).join("");
+  const weak = sm.weak_sounds.map((x) => `<li class="small"><strong>/${esc(x.sound)}/</strong> <span class="muted">average ${Math.round(x.mean)} in ${x.count} words${x.words.length ? `, for example ${x.words.map(esc).join(", ")}` : ""}</span></li>`).join("");
+  const earClips = r.ear ? r.ear.clips.map((c) => `<div class="small" style="margin:6px 0"><strong>${esc(c.word)}</strong> <span class="muted">sounds like</span> ${esc(c.heard)}<br>${esc(c.issue)}${c.fix ? `<br><span class="muted">Try:</span> ${esc(c.fix)}` : ""}</div>`).join("") : "";
+  const ear = r.ear ? `<p class="small muted" style="margin:10px 0 0">What an audio model heard when it listened to those words (${esc(r.ear.model)}):</p>${earClips}${r.ear.overall ? `<p class="small">${esc(r.ear.overall)}</p>` : ""}<p class="small muted">An AI model listening is less reliable than the scores above and can be wrong about a word. Trust a tip only if you can hear it yourself with “Listen”.</p>`
+    : r.ear_pending ? `<p class="small muted" style="margin:10px 0 0">An audio model is listening to the weakest words…</p>` : "";
+  box.innerHTML = `<h3>Pronunciation</h3>
+    <div style="margin:6px 0">${tiles}</div>
+    ${sm.worst_words.length ? `<p class="small muted" style="margin:8px 0 0">Words to work on (score out of 100, then each sound):</p>${words}` : `<p class="small">No word scored low. Nothing stands out in the sounds.</p>`}
+    ${weak ? `<p class="small muted" style="margin:8px 0 0">Sounds that were weak most often:</p><ul>${weak}</ul>` : ""}
+    ${ear}
+    <p class="small muted">Scored from the audio by Azure Speech, not from the transcript, so it hears what you really said. It judges against a standard accent: a different accent is not an error, so treat the scores as a guide. ${sm.n_words} words, ${Math.round(sm.seconds)} s.</p>
+    <button class="secondary" id="pron-again" style="margin-top:4px">Score again</button>`;
+  const audio = $("#sess-audio", document);
+  if (r.ear_pending) setTimeout(() => { if (document.body.contains(box)) setupPron(box.parentElement, detail); }, 2500);
+  box.querySelectorAll("button.play").forEach((b) => b.addEventListener("click", () => {
+    if (!audio) return;
+    audio.currentTime = Math.max(0, Number(b.dataset.t) - 0.15);
+    audio.play();
+    setTimeout(() => audio.pause(), 1400);
+  }));
+  $("#pron-again", box).addEventListener("click", async () => {
+    try { await api(`/api/sessions/${detail.id}/pronunciation`, { method: "POST" }); } catch (_) {}
+    setupPron(box.parentElement, detail);
+  });
+}
+
+async function setupPron(root, detail) {
+  const box = $("#pron", root);
+  if (!box || detail.status !== "done") return;
+  let r;
+  try { r = await api(`/api/sessions/${detail.id}/pronunciation`, {}); } catch (_) { return; }
+  if (r.state === "off") {
+    box.innerHTML = `<h3>Pronunciation</h3><p class="small muted">Not set up. A transcript often corrects what you said, so it cannot show pronunciation. Add AZURE_SPEECH_KEY and AZURE_SPEECH_REGION to .env to score it from the audio.</p>`;
+  } else if (r.state === "pending") {
+    box.innerHTML = `<h3>Pronunciation</h3><p class="small muted">Scoring the sounds in your audio…</p>`;
+    setTimeout(() => { if (document.body.contains(box)) setupPron(root, detail); }, 2500);
+  } else if (r.state === "done") {
+    renderPron(box, r, detail);
+  } else if (r.state === "error") {
+    box.innerHTML = `<h3>Pronunciation</h3><p class="err small">Could not score it: ${esc(r.error || "unknown error")}</p><button class="secondary" id="pron-go">Try again</button>`;
+    $("#pron-go", box).addEventListener("click", async () => { try { await api(`/api/sessions/${detail.id}/pronunciation`, { method: "POST" }); } catch (_) {} setupPron(root, detail); });
+  } else if (r.state === "none") {
+    box.innerHTML = `<h3>Pronunciation</h3><button class="secondary" id="pron-go">Score my pronunciation</button>`;
+    $("#pron-go", box).addEventListener("click", async () => { try { await api(`/api/sessions/${detail.id}/pronunciation`, { method: "POST" }); } catch (_) {} setupPron(root, detail); });
+  }
 }
 
 // ---------------------------------------------------------------- feedback from a language model

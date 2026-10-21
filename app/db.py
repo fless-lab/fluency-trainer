@@ -143,6 +143,13 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pronunciation (
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    unit TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (session_id, unit)
+);
 CREATE INDEX IF NOT EXISTS idx_sessions_checkpoint ON sessions(checkpoint);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 """
@@ -404,6 +411,21 @@ class DB:
             q += " AND purpose != ?"; args.append(exclude)
         with self.conn() as c:
             return int(c.execute(q, args).fetchone()[0])
+
+    # pronunciation ----------------------------------------------------------
+    def save_pronunciation(self, sid: str, unit: str, data: dict[str, Any]) -> None:
+        with self.conn() as c:
+            c.execute("INSERT OR REPLACE INTO pronunciation (session_id, unit, created_at, data) VALUES (?, ?, ?, ?)",
+                      (sid, unit, utcnow(), json.dumps(data, ensure_ascii=False)))
+
+    def get_pronunciation(self, sid: str) -> list[dict[str, Any]]:
+        with self.conn() as c:
+            rows = c.execute("SELECT unit, data FROM pronunciation WHERE session_id = ? ORDER BY rowid", (sid,)).fetchall()
+        return [{**json.loads(r["data"]), "unit": r["unit"]} for r in rows]
+
+    def clear_pronunciation(self, sid: str) -> None:
+        with self.conn() as c:
+            c.execute("DELETE FROM pronunciation WHERE session_id = ?", (sid,))
 
     # settings -------------------------------------------------------------
     def get_setting(self, key: str) -> str | None:
