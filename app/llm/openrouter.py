@@ -47,7 +47,7 @@ class OpenRouterLLM:
             raise LLMError(f"openrouter: unexpected response: {r.text[:800]}") from exc
         return LLMResult(self.name, self.model, text, data.get("usage") or {})
 
-    async def stream(self, system: str, user: str, max_tokens: int) -> AsyncIterator[str]:
+    async def stream(self, system: str, user: str, max_tokens: int, web: bool = False) -> AsyncIterator[str]:
         """Yield the answer piece by piece (server sent events with choices[0].delta.content, ending with [DONE])."""
         body = {"model": self.model, "max_tokens": max_tokens, "stream": True,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}

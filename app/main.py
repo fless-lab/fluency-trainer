@@ -72,6 +72,8 @@ class Feedback(BaseModel):
 
 class ConvStart(BaseModel):
     scenario: str = Field(default="", max_length=400)
+    research: bool = False
+    live_search: bool = False
     minutes: int = Field(default=10, ge=1, le=60)
     client_info: dict[str, Any] | None = None
 
@@ -573,7 +575,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def chat_prompt(sid: str, s: dict[str, Any], opening: bool) -> str:
         scenario = s["topic_text"] or "A relaxed, friendly chat."
-        return opening_prompt(scenario) if opening else reply_prompt(scenario, db.get_turns(sid))
+        brief = db.get_setting(f"brief:{sid}") or ""
+        return opening_prompt(scenario, brief) if opening else reply_prompt(scenario, db.get_turns(sid), brief)
 
     def chat_gate(sid: str) -> None:
         if chat_llm is None:
@@ -600,20 +603,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             jobs.append(asyncio.create_task(speak_part(sid, idx, part, text)))
 
         try:
-            async for piece in chat_llm.stream(CONV_SYSTEM, prompt, 220):
-                if first_text_s is None:
-                    first_text_s = round(time.monotonic() - started, 2)
-                buffer += piece
-                ready, buffer = split_ready(buffer)
-                for text in ready:
-                    if sum(len(x.split()) for x in sentences) >= words_budget:
-                        break
-                    launch(text)
-                    while jobs and jobs[0].done():
-                        out = jobs.pop(0).result()
-                        first_audio_s = first_audio_s or round(time.monotonic() - started, 2)
-                        yield {"type": "sentence", "idx": idx, **out}
-                    await asyncio.sleep(0)
+            use_web = bool(db.get_setting(f"livesearch:{sid}")) and hasattr(chat_llm, "research")
+            for attempt in (0, 1):
+                try:
+                    async for piece in chat_llm.stream(CONV_SYSTEM, prompt, 220 if not use_web else 400, web=use_web):
+                        if first_text_s is None:
+                            first_text_s = round(time.monotonic() - started, 2)
+                        buffer += piece
+                        ready, buffer = split_ready(buffer)
+                        for text in ready:
+                            if sum(len(x.split()) for x in sentences) >= words_budget:
+                                break
+                            launch(text)
+                            while jobs and jobs[0].done():
+                                out = jobs.pop(0).result()
+                                first_audio_s = first_audio_s or round(time.monotonic() - started, 2)
+                                yield {"type": "sentence", "idx": idx, **out}
+                            await asyncio.sleep(0)
+                    break
+                except LLMError as exc:
+                    if use_web and attempt == 0 and first_text_s is None:  # the chat model may not support search: retry without
+                        events.write("chat.search_unavailable", sid, error=str(exc)[:300])
+                        db.set_setting(f"livesearch:{sid}", "")
+                        use_web = False
+                        continue
+                    raise
         except LLMError as exc:
             events.write("chat.error", sid, error=str(exc))
             for j in jobs:
@@ -679,7 +693,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "planned_seconds": body.minutes * 60, "prep_seconds": 0, "status": "created",
             "client_info": json.dumps(body.client_info or {}, ensure_ascii=False), "group_id": None, "drill_round": None,
         })
-        events.write("conv.start", sid, scenario=scenario, minutes=body.minutes, voice=tts.name if tts else None)
+        events.write("conv.start", sid, scenario=scenario, minutes=body.minutes, voice=tts.name if tts else None,
+                     research=body.research, live_search=body.live_search)
+        if body.live_search:
+            db.set_setting(f"livesearch:{sid}", "1")
+        research_note = None
+        if body.research:
+            researcher = next((m for m in (llm, chat_llm) if m is not None and hasattr(m, "research")), None)
+            if researcher is None:
+                research_note = "The partner could not read up on the topic: this model provider has no web search here (use LLM_PROVIDER=anthropic)."
+            else:
+                started = time.monotonic()
+                try:
+                    brief = await researcher.research(scenario, local_today().isoformat())
+                    db.set_setting(f"brief:{sid}", brief)
+                    db.log_llm_call("research", sid)
+                    events.write("conv.research", sid, seconds=round(time.monotonic() - started, 2), model=researcher.model, chars=len(brief))
+                except LLMError as exc:
+                    events.write("conv.research_error", sid, error=str(exc))
+                    research_note = f"The partner could not read up on the topic ({exc}). It will talk from general knowledge."
         sentences = []
         try:
             async for ev in stream_partner(sid, db.get_session(sid), opening=True):
@@ -688,7 +720,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except HTTPException:
             db.update_session(sid, status="error", error="The partner could not start the conversation.")
             raise
-        return {"id": sid, "scenario": scenario, "sentences": sentences}
+        return {"id": sid, "scenario": scenario, "sentences": sentences, "research_note": research_note,
+                "researched": bool(db.get_setting(f"brief:{sid}"))}
 
     @app.get("/api/conversations/{sid}/turns/{idx}/audio")
     def conv_turn_audio(sid: str, idx: int, part: int = 0) -> FileResponse:

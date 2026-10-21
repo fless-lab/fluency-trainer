@@ -931,12 +931,12 @@ async function readNdjson(response, onEvent) {
   }
 }
 
-async function runConversation(scenario, minutes, patienceMs) {
+async function runConversation(scenario, minutes, patienceMs, research, liveSearch) {
   const info = { ua: navigator.userAgent, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, screen: `${screen.width}x${screen.height}` };
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch (e) { alert(`The microphone is not available (${e.name}). Allow microphone access for this page and try again.`); return; }
-  const box = openOverlay(`<button class="secondary" id="cancel">Cancel</button><p class="tag" style="margin-top:24px">Conversation</p><div class="big-topic">${esc(scenario || "A relaxed chat.")}</div><div id="stage"><p class="muted">Starting…</p></div>`);
+  const box = openOverlay(`<button class="secondary" id="cancel">Cancel</button><p class="tag" style="margin-top:24px">Conversation</p><div class="big-topic">${esc(scenario || "A relaxed chat.")}</div><div id="stage"><p class="muted">${research ? "Your partner is reading up on this first. A few seconds." : "Starting…"}</p></div>`);
   const stage = $("#stage", box);
   let sid = null, over = false, doneNow = false, ending = false;
   const stopMic = () => stream.getTracks().forEach((t) => t.stop());
@@ -950,11 +950,12 @@ async function runConversation(scenario, minutes, patienceMs) {
 
   // the partner's first line
   let first;
-  try { first = await api("/api/conversations", { method: "POST", body: { scenario, minutes, client_info: info } }); }
+  try { first = await api("/api/conversations", { method: "POST", body: { scenario, minutes, research: !!research, live_search: !!liveSearch, client_info: info } }); }
   catch (e) { stopMic(); stage.innerHTML = `<p class="err">Could not start: ${esc(e.message)}</p>`; return; }
   sid = first.id;
-  logEvent("conv_opened", { patience_ms: patienceMs, minutes, live_stt: liveOk }, sid);
+  logEvent("conv_opened", { patience_ms: patienceMs, minutes, live_stt: liveOk, researched: first.researched }, sid);
   stage.innerHTML = `<div id="say" class="saybox"></div><p class="muted" id="state"></p><div class="clock small" id="clock">00:00</div><div class="row"><button class="primary" id="done-turn" hidden>I'm done talking</button><button class="secondary" id="end">End and get feedback</button></div><p class="small muted" id="vnote"></p>`;
+  if (first.research_note) { const n = document.createElement("p"); n.className = "small muted"; n.textContent = first.research_note; stage.prepend(n); }
   const say = $("#say", stage), stateEl = $("#state", stage), doneBtn = $("#done-turn", stage), note = $("#vnote", stage);
   const add = (who, text) => { const d = document.createElement("div"); d.className = `say-${who}`; d.textContent = text; say.appendChild(d); say.scrollTop = say.scrollHeight; return d; };
   $("#end", stage).addEventListener("click", () => { ending = true; doneNow = true; });
@@ -1062,15 +1063,17 @@ async function conversationCard() {
   return `<div class="card"><h3>Talk with a partner</h3><p class="muted small">A spoken conversation. The partner asks, you answer out loud, it waits for you as long as you choose. Your speech is measured like any other session, then you get the same feedback. ${ready ? "" : `<span class="err">Not available: ${esc(cfg.llm_error || "no language model")}</span>`}</p>
     <div class="row"><select id="conv-scn">${SCENARIOS.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}<option value="">My own scenario…</option></select><select id="conv-len"><option value="5">5 min</option><option value="10" selected>10 min</option><option value="20">20 min</option></select><select id="conv-wait" title="How long the partner waits after you go quiet"><option value="2500">Waits 2.5 s</option><option value="4000" selected>Waits 4 s</option><option value="6000">Waits 6 s</option></select></div>
     <div class="row" style="margin-top:8px"><input type="text" id="conv-custom" placeholder="Describe the situation" size="50" hidden><button class="primary" id="conv-start" ${ready ? "" : "disabled"}>Start</button></div>
-    <p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
+    <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label><p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
 }
 
 function wireConversationCard() {
   const sel = $("#conv-scn"); if (!sel) return;
-  sel.addEventListener("change", () => { const c = $("#conv-custom"); c.hidden = sel.value !== ""; if (!c.hidden) c.focus(); });
+  const rs = $("#conv-research");
+  const autoResearch = () => { rs.checked = sel.value === "" || /news/i.test(sel.value); };
+  sel.addEventListener("change", () => { const c = $("#conv-custom"); c.hidden = sel.value !== ""; if (!c.hidden) c.focus(); autoResearch(); });
   $("#conv-start").addEventListener("click", () => {
     const scn = sel.value || $("#conv-custom").value.trim();
     if (!scn) { alert("Describe the situation first."); return; }
-    runConversation(scn, Number($("#conv-len").value), Number($("#conv-wait").value));
+    runConversation(scn, Number($("#conv-len").value), Number($("#conv-wait").value), $("#conv-research").checked, $("#conv-live").checked);
   });
 }

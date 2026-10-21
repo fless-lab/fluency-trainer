@@ -49,10 +49,12 @@ class AnthropicLLM:
             raise LLMError(f"anthropic: unexpected response: {r.text[:800]}") from exc
         return LLMResult(self.name, self.model, text, data.get("usage") or {})
 
-    async def stream(self, system: str, user: str, max_tokens: int) -> AsyncIterator[str]:
+    async def stream(self, system: str, user: str, max_tokens: int, web: bool = False) -> AsyncIterator[str]:
         """Yield the answer piece by piece (server sent events: content_block_delta with delta.text)."""
         body = {"model": self.model, "max_tokens": max_tokens, "system": system, "stream": True,
                 "messages": [{"role": "user", "content": user}]}
+        if web:  # the model decides by itself when a search is needed; the text after the search is streamed as usual
+            body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
         headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
@@ -72,3 +74,26 @@ class AnthropicLLM:
                             raise LLMError(f"anthropic: {ev.get('error')}")
         except httpx.HTTPError as exc:
             raise LLMError(f"anthropic: network error: {exc}") from exc
+
+    async def research(self, topic: str, today: str, max_searches: int = 3) -> str:
+        """Read up on a topic with Anthropic's web search tool and return a short brief. Priced per search."""
+        from ..conversation import RESEARCH_SYSTEM
+        body = {"model": self.model, "max_tokens": 1200, "system": RESEARCH_SYSTEM.format(today=today),
+                "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": max_searches}],
+                "messages": [{"role": "user", "content": f"Topic: {topic}"}]}
+        headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.post(f"{self.base}/v1/messages", json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            raise LLMError(f"anthropic: network error: {exc}") from exc
+        if r.status_code >= 400:
+            raise LLMError(f"anthropic: HTTP {r.status_code}: {r.text[:800]}")
+        try:
+            data = r.json()
+            text = "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text").strip()
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise LLMError(f"anthropic: unexpected response: {r.text[:800]}") from exc
+        if not text:
+            raise LLMError("anthropic: the search returned no text")
+        return text

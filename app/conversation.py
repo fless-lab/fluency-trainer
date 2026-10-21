@@ -15,27 +15,57 @@ JOIN_GAP_MS = 200  # below the 250 ms pause threshold, so joining two turns neve
 MAX_PARTNER_WORDS = 60
 
 SYSTEM = (
-    "You are a friendly conversation partner helping someone practise speaking English aloud. "
-    "The person already knows English and wants to speak it more fluently. "
-    "Keep each reply short: one to three sentences, under 45 words, natural spoken English, no lists, no markdown, "
-    "no emojis. Ask at most one question at a time and let the person do most of the talking. "
-    "Do not correct their English and do not comment on their mistakes during the conversation: feedback comes later. "
+    "You are a friendly person having a real spoken conversation with someone who is practising their English aloud. "
+    "They already know English and want to speak it more fluently. Be a real conversation partner, not an interviewer. "
+    "In each turn: first react to what they just said with something of your own, such as an opinion, a fact, a short "
+    "example or a personal-style remark, and take a position when asked what you think. Ask a question only some of "
+    "the time, never as your only content. If they ask you a question, answer it directly and honestly first, with your "
+    "own view, then you may continue; never hand their question back. "
+    "You have no live news feed unless a search tool is offered: on recent events say what you generally know, say plainly "
+    "when you may be out of date, and never invent facts. If a search tool is offered, use it only for facts you are not "
+    "sure of, never announce that you are searching, and keep the answer short anyway. On political topics give balanced, factual points and say that people disagree. "
+    "Keep each reply short, natural spoken English: two to four sentences, under 55 words, no lists, no markdown, no emojis. "
+    "Do not correct their English and do not comment on their mistakes: feedback comes later. "
     "Use everyday words, a little simpler than your own natural level, but never baby talk. "
-    "If their last turn was short or unclear, ask about it or invite them to say more. "
     "Reply with the next thing the partner says and nothing else."
 )
 
 
-def opening_prompt(scenario: str) -> str:
-    return (f"Scenario: {scenario}\n\nStart the conversation with one short, friendly line that begins the scenario "
+def brief_block(brief: str) -> str:
+    return (f"Background you looked up before the conversation (use it naturally, do not read it out, it may be incomplete):\n{brief}\n\n"
+            if brief else "")
+
+
+def opening_prompt(scenario: str, brief: str = "") -> str:
+    return (f"{brief_block(brief)}Scenario: {scenario}\n\nStart the conversation with one short, friendly line that begins the scenario "
             "and invites the person to speak. Reply with that line only.")
 
 
-def reply_prompt(scenario: str, turns: list[dict[str, Any]]) -> str:
-    lines = [f"Scenario: {scenario}", "", "Conversation so far:"]
+
+
+def turn_guidance(scenario: str, turns: list[dict[str, Any]]) -> str:
+    """Rules that depend on the conversation so far, so the partner cannot fall into asking a question every turn."""
+    notes = []
+    last_user = next((t for t in reversed(turns) if t["role"] == "user"), None)
+    last_partner = next((t for t in reversed(turns) if t["role"] == "partner"), None)
+    if last_user and "?" in last_user["text"]:
+        notes.append("The person just asked you something. Answer it directly with your own view or what you know, "
+                     "before anything else, and do not turn it back on them.")
+    interview = "interview" in scenario.lower()
+    if not interview and last_partner and last_partner["text"].rstrip().endswith("?"):
+        notes.append("Your previous line ended with a question, so this time do not ask one: share an opinion, a fact or a "
+                     "short example that moves the topic forward, and end on a statement.")
+    return " ".join(notes)
+
+
+def reply_prompt(scenario: str, turns: list[dict[str, Any]], brief: str = "") -> str:
+    lines = [brief_block(brief) + f"Scenario: {scenario}", "", "Conversation so far:"]
     for t in turns:
         who = "Partner" if t["role"] == "partner" else "Person"
         lines.append(f"{who}: {t['text']}")
+    g = turn_guidance(scenario, turns)
+    if g:
+        lines += ["", g]
     lines += ["", "Write the Partner's next line."]
     return "\n".join(lines)
 
@@ -99,3 +129,10 @@ def split_ready(buffer: str, final: bool = False) -> tuple[list[str], str]:
             out.append(rest.strip())
         rest = ""
     return out, rest.lstrip()
+
+
+RESEARCH_SYSTEM = (
+    "You prepare a conversation partner. Search the web for the current facts about the topic, then write a neutral "
+    "brief of 120 to 200 words: the main facts, who the main actors are, dates, and the points on which people disagree. "
+    "Say what is uncertain or changing. Plain sentences, no markdown, no links. Today's date is {today}."
+)

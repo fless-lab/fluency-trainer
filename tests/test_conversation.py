@@ -113,3 +113,18 @@ def test_format_retry(monkeypatch):
     assert calls == ["mp3", "pcm"] and out.audio[:4] == b"RIFF"
     out = asyncio.run(OpenAICompatTTS("openrouter", "k", "google/gemini-x-tts", "v").speak("hello"))
     assert calls[-1] == "pcm"
+
+
+def test_guidance_alternates_questions_and_answers_questions():
+    from app.conversation import reply_prompt
+    turns = [{"role": "partner", "text": "What do you think about it?"}, {"role": "user", "text": "I read it. Do you know what they protest?"}]
+    p = reply_prompt("France politics", turns, "BRIEF")
+    assert "Answer it directly" in p and "do not ask one" in p and "BRIEF" in p
+    p2 = reply_prompt("A job interview for a role", turns)
+    assert "do not ask one" not in p2
+
+
+def test_research_and_live_search_options(tmp_path):
+    with TestClient(create_app(settings(tmp_path))) as c:
+        r = c.post("/api/conversations", json={"scenario": "news about France", "research": True, "live_search": True}).json()
+        assert r["researched"] is True and r["sentences"]
