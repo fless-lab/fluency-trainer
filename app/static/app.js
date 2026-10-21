@@ -904,10 +904,11 @@ function speakBrowser(text) {
   });
 }
 
-function playUrl(url, onBlocked) {
+function playUrl(url, onBlocked, handle) {
   return new Promise((resolve) => {
     const a = new Audio(url);
     a.onended = a.onerror = () => resolve();
+    if (handle) handle.stop = () => { a.pause(); resolve(); };
     a.play().catch(() => { onBlocked && onBlocked(); resolve(); });
   });
 }
@@ -943,14 +944,19 @@ class LiveSTT {
     }
   }
   async begin() {  // called while the partner talks, so the connection is ready when the person starts
-    this.close(); this.turns = {}; this.carry = []; this.buffered = []; this.ready = false; this.terminated = null;
+    this.close(); this.turns = {}; this.completeAt = null; this.carry = []; this.buffered = []; this.ready = false; this.terminated = null;
     try {
       const t = await api("/api/conversations/stream-token");
-      const ws = new WebSocket(`${t.url}?sample_rate=16000&token=${encodeURIComponent(t.token)}`);
+      const ws = new WebSocket(`${t.url}?sample_rate=16000&token=${encodeURIComponent(t.token)}&end_of_turn_confidence_threshold=0.6&min_end_of_turn_silence_when_confident=300&max_turn_silence=3000`);
       this.ws = ws;
       ws.onmessage = (e) => {
         let m; try { m = JSON.parse(e.data); } catch (_) { return; }
-        if (m.type === "Turn" && typeof m.turn_order === "number") this.turns[m.turn_order] = m.transcript || "";
+        if (m.type === "Turn" && typeof m.turn_order === "number") {
+          this.turns[m.turn_order] = m.transcript || "";
+          // AssemblyAI's own end-of-turn call (it listens to the words and the sound): complete until new speech arrives
+          if (m.end_of_turn) this.completeAt = performance.now(); else if (m.transcript) this.completeAt = null;
+        }
+        if (m.type === "SpeechStarted") this.completeAt = null;
         if (m.type === "Termination" && this.terminated) this.terminated();
       };
       await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error("websocket")); setTimeout(() => rej(new Error("timeout")), 4000); });
@@ -960,10 +966,11 @@ class LiveSTT {
     } catch (e) { logEvent("live_stt_unavailable", { error: String(e) }); this.ready = false; }
   }
   listen() { this.sending = true; }
+  heard() { return Object.keys(this.turns).map(Number).sort((x, y) => x - y).map((k) => this.turns[k]).join(" ").replace(/\s+/g, " ").trim(); }
   async finish() {  // stop sending, ask AssemblyAI to close the open turn, and return everything it heard
     this.sending = false;
     if (this.ready && this.ws && this.ws.readyState === 1) {
-      const done = new Promise((r) => { this.terminated = r; setTimeout(r, 1500); });
+      const done = new Promise((r) => { this.terminated = r; setTimeout(r, this.completeAt ? 250 : 1500); });  // already complete: no need to wait long
       try { this.ws.send(JSON.stringify({ type: "Terminate" })); } catch (_) {}
       await done;
     }
@@ -972,6 +979,23 @@ class LiveSTT {
     return text;
   }
   close() { try { if (this.ws) this.ws.close(); } catch (_) {} this.ws = null; this.ready = false; }
+}
+
+// A neural voice activity detector (Silero VAD, MIT licence), run in the browser from files bundled in
+// app/static/vendor/vad. It tells speech from noise, breathing and echo far better than a loudness threshold.
+// If it cannot load, the conversation falls back to the loudness threshold.
+function loadScript(src) { return new Promise((res, rej) => { const el = document.createElement("script"); el.src = src; el.onload = res; el.onerror = () => rej(new Error(`cannot load ${src}`)); document.head.appendChild(el); }); }
+async function startVad(ctx, stream, onProb) {
+  const dir = "/static/vendor/vad/";
+  try {
+    if (!(window.ort && window.vad)) { await loadScript(`${dir}ort.wasm.min.js`); await loadScript(`${dir}bundle.min.js`); }
+    window.ort.env.wasm.wasmPaths = dir; window.ort.env.wasm.numThreads = 1;
+    return await window.vad.MicVAD.new({
+      model: "v5", audioContext: ctx, baseAssetPath: dir, onnxWASMBasePath: dir, startOnLoad: true,
+      getStream: async () => stream, pauseStream: async () => {}, resumeStream: async () => stream,
+      onFrameProcessed: (p) => onProb(p.isSpeech), onSpeechStart: () => {}, onSpeechEnd: () => {}, onVADMisfire: () => {},
+    });
+  } catch (e) { logEvent("vad_unavailable", { error: String(e && e.message || e) }); return null; }
 }
 
 async function readNdjson(response, onEvent) {
@@ -989,10 +1013,10 @@ async function readNdjson(response, onEvent) {
   }
 }
 
-async function runConversation(scenario, minutes, patienceMs, research, liveSearch) {
+async function runConversation(scenario, minutes, patienceMs, research, liveSearch, bargeIn) {
   const info = { ua: navigator.userAgent, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, screen: `${screen.width}x${screen.height}` };
   let stream;
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
   catch (e) { alert(`The microphone is not available (${e.name}). Allow microphone access for this page and try again.`); return; }
   const box = openOverlay(`<button class="secondary" id="cancel">Cancel</button><p class="tag" style="margin-top:24px">Conversation</p><div class="big-topic">${esc(scenario || "A relaxed chat.")}</div><div id="stage"><p class="muted">${research ? "Your partner is reading up on this first. A few seconds." : "Starting…"}</p></div>`);
   const stage = $("#stage", box);
@@ -1012,14 +1036,47 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   catch (e) { stopMic(); stage.innerHTML = `<p class="err">Could not start: ${esc(e.message)}</p>`; return; }
   sid = first.id;
   logEvent("conv_opened", { patience_ms: patienceMs, minutes, live_stt: liveOk, researched: first.researched }, sid);
-  stage.innerHTML = `<div id="say" class="saybox"></div><p class="muted" id="state"></p><div class="clock small" id="clock">00:00</div><div class="row"><button class="primary" id="done-turn" hidden>I'm done talking</button><button class="secondary" id="end">End and get feedback</button></div><p class="small muted" id="vnote"></p>`;
+  stage.innerHTML = `<div class="conv-top"><span class="pill" id="pill"><i class="dot"></i><span id="state"></span></span><div class="clock small" id="clock">00:00</div></div>
+    <div class="meter" aria-hidden="true"><div id="meter"></div></div>
+    <div id="say" class="saybox"></div>
+    <div class="conv-actions">
+      <button class="primary big" id="done-turn" disabled>I'm done</button>
+      <button class="secondary" id="interrupt" hidden>Interrupt</button>
+      <div class="seg" role="group" aria-label="Who decides when you have finished"><button id="m-manual">I press when done</button><button id="m-auto">Auto</button></div>
+      <button class="secondary" id="end">End and get feedback</button>
+    </div>
+    <p class="small muted" id="vnote"></p>`;
   if (first.research_note) { const n = document.createElement("p"); n.className = "small muted"; n.textContent = first.research_note; stage.prepend(n); }
   const say = $("#say", stage), stateEl = $("#state", stage), doneBtn = $("#done-turn", stage), note = $("#vnote", stage);
+  const pill = $("#pill", stage), meter = $("#meter", stage), interruptBtn = $("#interrupt", stage);
+  const setPhase = (phase, text) => { pill.dataset.phase = phase; stateEl.textContent = text; };
+  // who decides that you have finished: you (button) or the app (a pause), switchable at any time
+  let auto = patienceMs > 0; const basePatience = patienceMs || 4000;
+  const quietAfterComplete = Math.round(basePatience * 0.14);  // 6 s patient: 0.8 s, 4 s normal: 0.6 s, 2.5 s quick: 0.35 s
+  const drawMode = () => { $("#m-manual", stage).classList.toggle("on", !auto); $("#m-auto", stage).classList.toggle("on", auto); };
+  $("#m-manual", stage).addEventListener("click", () => { auto = false; drawMode(); });
+  $("#m-auto", stage).addEventListener("click", () => { auto = true; drawMode(); });
+  drawMode();
+  // a hesitating speaker is not finished: wait longer after a filler or a connector, answer sooner after a full stop
+  const UNFINISHED = /(^|\s)(uh|um|er|eh|like|and|but|so|because|or|the|a|an|to|of|that|which|who|with|i mean|you know|i think|kind of|sort of)[\s,.…-]*$/i;
+  const patienceFor = (text) => {
+    if (!text) return basePatience;
+    if (UNFINISHED.test(text) || /[,…]\s*$/.test(text)) return Math.min(basePatience * 2, 10000);
+    if (/[.?!]\s*$/.test(text)) return Math.max(basePatience * 0.6, 1500);
+    return basePatience;
+  };
   const add = (who, text) => { const d = document.createElement("div"); d.className = `say-${who}`; d.textContent = text; say.appendChild(d); say.scrollTop = say.scrollHeight; return d; };
   $("#end", stage).addEventListener("click", () => { ending = true; doneNow = true; });
   doneBtn.addEventListener("click", () => { doneNow = true; });
+  let partnerPlayer = null, bargedIn = false;
+  const interrupt = () => { if (partnerPlayer) { bargedIn = true; partnerPlayer.stop(); } };
+  interruptBtn.addEventListener("click", interrupt);
 
-  // loudness-based voice detection, calibrated on the room noise: decides when you started and when you went quiet
+  let vadProb = 0;
+  const vadInst = await startVad(ctx, stream, (p) => { vadProb = p; });
+  const vadOk = !!vadInst;
+  logEvent("conv_vad", { neural: vadOk }, sid);
+  // loudness-based voice detection, calibrated on the room noise (used for the meter, and if the neural detector is missing)
   const analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
   ctx.createMediaStreamSource(stream).connect(analyser);
   const buf = new Float32Array(analyser.fftSize);
@@ -1027,33 +1084,42 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   await sleep(300);
   let ambient = 0; for (let i = 0; i < 6; i++) { ambient = Math.max(ambient, level()); await sleep(50); }
   const threshold = Math.min(0.08, Math.max(0.02, ambient * 3));
+  let loudMs = 0;
+  const watch = setInterval(() => {  // draws the microphone level, and lets you interrupt the partner by talking over it
+    const lv = level();
+    meter.style.width = `${Math.min(100, Math.round((lv / Math.max(threshold * 3, 0.06)) * 100))}%`;
+    if (bargeIn && partnerPlayer && (vadOk ? vadProb > 0.8 : lv > threshold * 2)) { loudMs += 80; if (loudMs >= 320) { loudMs = 0; logEvent("conv_barge_in", {}, sid); interrupt(); } } else loudMs = 0;
+  }, 80);
+  const isVoice = () => (vadOk ? vadProb > 0.5 : level() > threshold);
   const t0 = performance.now();
   const tick = setInterval(() => { const c = $("#clock", stage); if (c) c.textContent = mmss((performance.now() - t0) / 1000); }, 500);
 
   // The partner's sentences are played in order, as they arrive.
   const makePlayer = () => {
-    const queue = []; let finished = false, wake = null, bubble = null, text = "";
+    const queue = []; let finished = false, wake = null, bubble = null, text = "", cur = {}, stopped = false;
     const run = (async () => {
       for (;;) {
         if (queue.length) {
           const sn = queue.shift();
           if (!bubble) bubble = add("partner", ""); text = (text + " " + sn.text).trim(); bubble.textContent = text; say.scrollTop = say.scrollHeight;
           note.textContent = sn.audio_url ? "" : (sn.voice_note || "");
-          if (sn.audio_url) await playUrl(sn.audio_url, () => { note.textContent = "Your browser blocked the sound. Click anywhere, then it works."; });
+          if (sn.audio_url) await playUrl(sn.audio_url, () => { note.textContent = "Your browser blocked the sound. Click anywhere, then it works."; }, cur);
           else await speakBrowser(sn.text);
+          if (stopped) break;
         } else if (finished) break;
         else await new Promise((r) => { wake = r; });
       }
     })();
-    return { push: (sn) => { queue.push(sn); if (wake) { const w = wake; wake = null; w(); } }, end: () => { finished = true; if (wake) { const w = wake; wake = null; w(); } }, done: run };
+    const stop = () => { stopped = true; finished = true; queue.length = 0; if (cur.stop) cur.stop(); window.speechSynthesis && window.speechSynthesis.cancel(); if (wake) { const w = wake; wake = null; w(); } };
+    return { stop, push: (sn) => { if (!stopped) queue.push(sn); if (wake) { const w = wake; wake = null; w(); } }, end: () => { finished = true; if (wake) { const w = wake; wake = null; w(); } }, done: run };
   };
   let partnerEndedAt = performance.now();
-  stateEl.textContent = "Your partner is speaking…";
+  setPhase("partner", "Your partner is speaking…"); interruptBtn.hidden = false;
   if (liveOk) live.begin();
-  { const pl = makePlayer(); first.sentences.forEach(pl.push); pl.end(); await pl.done; partnerEndedAt = performance.now(); }
+  { const pl = makePlayer(); partnerPlayer = pl; first.sentences.forEach(pl.push); pl.end(); await pl.done; partnerPlayer = null; interruptBtn.hidden = true; partnerEndedAt = performance.now(); }
 
   while (!over) {
-    stateEl.textContent = "Your turn. Take your time."; doneBtn.hidden = false; doneNow = false;
+    setPhase("you", auto ? "Your turn. I answer when you pause." : "Your turn. Press “I'm done” when you finish."); doneBtn.disabled = false; doneNow = false; bargedIn = false;
     if (liveOk) live.listen();
     const mt = pickMime();
     const rec = new MediaRecorder(stream, mt ? { mimeType: mt } : undefined);
@@ -1064,20 +1130,25 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
     while (!over && !doneNow) {
       await sleep(80);
       const now = performance.now();
-      if (level() > threshold) { voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 160) { spoke = true; firstSpeechAt = now - 160; stateEl.textContent = "Listening…"; } }
-      if (spoke && now - lastVoiceAt > patienceMs) break;
+      if (isVoice()) { voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 160) { spoke = true; firstSpeechAt = now - 160; setPhase("you", auto ? "Listening… I answer when you pause." : "Listening… press “I'm done” when you finish."); } }
+      if (auto && spoke) {
+        // like a voice assistant: answer soon after a finished sentence, wait longer when you are still searching for words
+        const heard = liveOk ? live.heard() : "", quiet = now - lastVoiceAt;
+        if (liveOk && live.completeAt && quiet > quietAfterComplete && !UNFINISHED.test(heard)) break;
+        if (quiet > patienceFor(heard)) break;
+      }
       if (now - turnStart > 150000) break;
     }
     const durationS = (performance.now() - turnStart) / 1000;
     await new Promise((resolve) => { rec.onstop = resolve; if (rec.state !== "inactive") rec.stop(); });
     if (over) break;
     if (!spoke) { if (ending) break; continue; }  // nothing said: keep waiting, nothing is sent
-    stateEl.textContent = "…"; doneBtn.hidden = true;
+    setPhase("thinking", "…"); doneBtn.disabled = true;
     const liveText = liveOk ? await live.finish() : "";
     const fd = new FormData();
     fd.append("file", new Blob(chunks, { type: rec.mimeType || "audio/webm" }), "turn.webm");
     fd.append("duration_s", String(durationS)); fd.append("mime", (rec.mimeType || "audio/webm").split(";")[0]);
-    fd.append("latency_ms", String(Math.round(firstSpeechAt - partnerEndedAt)));
+    fd.append("latency_ms", String(Math.max(0, Math.round(firstSpeechAt - partnerEndedAt))));
     fd.append("live_text", liveText);
     const sentAt = performance.now();
     let gotAudio = false, errMsg = null, empty = false;
@@ -1085,21 +1156,23 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
       const r = await fetch(`/api/conversations/${sid}/turn`, { method: "POST", body: fd });
       if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || r.statusText); }
       if (liveOk && !ending) live.begin();  // reconnect while the partner answers
-      stateEl.textContent = "Your partner is answering…";
-      const pl = makePlayer();
+      setPhase("partner", "Your partner is answering…"); interruptBtn.hidden = false;
+      const pl = makePlayer(); partnerPlayer = pl;
       await readNdjson(r, async (ev) => {
         if (ev.type === "empty") { empty = true; }
         else if (ev.type === "user") { add("user", ev.text); if (ending) return "stop"; }
+        else if (bargedIn) { return "stop"; }
         else if (ev.type === "sentence") { if (!gotAudio) { gotAudio = true; logEvent("conv_first_sentence", { ms_after_send: Math.round(performance.now() - sentAt) }, sid); } pl.push(ev); }
         else if (ev.type === "error") { errMsg = ev.message; }
       });
-      pl.end(); await pl.done; partnerEndedAt = performance.now();
+      pl.end(); await pl.done; partnerPlayer = null; interruptBtn.hidden = true; partnerEndedAt = performance.now();
     } catch (e) { errMsg = e.message; logEvent("conv_turn_failed", { error: String(e) }, sid); }
-    if (empty) { stateEl.textContent = "I did not catch any words. Try again."; if (ending) break; if (liveOk) live.begin(); continue; }
+    partnerPlayer = null; interruptBtn.hidden = true;
+    if (empty) { setPhase("you", "I did not catch any words. Try again."); if (ending) break; if (liveOk) live.begin(); continue; }
     if (errMsg) { stateEl.innerHTML = `<span class="err">${esc(errMsg)}</span> Say it again, or end the conversation.`; if (liveOk && !ending) live.begin(); if (ending) break; continue; }
     if (ending || (performance.now() - t0) / 60000 >= minutes) break;
   }
-  clearInterval(tick); stopMic(); if (live) live.close(); ctx.close();
+  clearInterval(tick); clearInterval(watch); if (vadInst) { try { vadInst.destroy(); } catch (_) {} } stopMic(); if (live) live.close(); ctx.close();
   if (over) return;
   stage.innerHTML = `<p class="muted">Finishing… the last recordings are being transcribed.</p>`;
   const end = await api(`/api/conversations/${sid}/end`, { method: "POST", body: {} }).catch((e) => ({ status: "error", error: e.message }));
@@ -1118,10 +1191,10 @@ async function conversationCard() {
   const cfg = await api("/api/conversations/config").catch(() => null);
   if (!cfg) return "";
   const ready = cfg.llm_ready;
-  return `<div class="card"><h3>Talk with a partner</h3><p class="muted small">A spoken conversation. The partner asks, you answer out loud, it waits for you as long as you choose. Your speech is measured like any other session, then you get the same feedback. ${ready ? "" : `<span class="err">Not available: ${esc(cfg.llm_error || "no language model")}</span>`}</p>
-    <div class="row"><select id="conv-scn">${SCENARIOS.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}<option value="">My own scenario…</option></select><select id="conv-len"><option value="5">5 min</option><option value="10" selected>10 min</option><option value="20">20 min</option></select><select id="conv-wait" title="How long the partner waits after you go quiet"><option value="2500">Waits 2.5 s</option><option value="4000" selected>Waits 4 s</option><option value="6000">Waits 6 s</option></select></div>
+  return `<div class="card"><h3>Talk with a partner</h3><p class="muted small">A spoken conversation. The partner asks, you answer out loud, you choose whether you press “I'm done” or it answers by itself when your sentence is finished (and waits when you hesitate), and you can talk over it to interrupt. Your speech is measured like any other session, then you get the same feedback. ${ready ? "" : `<span class="err">Not available: ${esc(cfg.llm_error || "no language model")}</span>`}</p>
+    <div class="row"><select id="conv-scn">${SCENARIOS.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}<option value="">My own scenario…</option></select><select id="conv-len"><option value="5">5 min</option><option value="10" selected>10 min</option><option value="20">20 min</option></select><select id="conv-wait" title="Who decides that you have finished speaking"><option value="0" selected>I press “I'm done”</option><option value="6000">Auto, patient</option><option value="4000">Auto, natural</option><option value="2500">Auto, quick</option></select></div>
     <div class="row" style="margin-top:8px"><input type="text" id="conv-custom" placeholder="Describe the situation" size="50" hidden><button class="primary" id="conv-start" ${ready ? "" : "disabled"}>Start</button></div>
-    <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label><p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
+    <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-barge" checked> Let me interrupt the partner by talking over it (works best with headphones)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label><p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
 }
 
 function wireConversationCard() {
@@ -1132,6 +1205,6 @@ function wireConversationCard() {
   $("#conv-start").addEventListener("click", () => {
     const scn = sel.value || $("#conv-custom").value.trim();
     if (!scn) { alert("Describe the situation first."); return; }
-    runConversation(scn, Number($("#conv-len").value), Number($("#conv-wait").value), $("#conv-research").checked, $("#conv-live").checked);
+    runConversation(scn, Number($("#conv-len").value), Number($("#conv-wait").value), $("#conv-research").checked, $("#conv-live").checked, $("#conv-barge").checked);
   });
 }

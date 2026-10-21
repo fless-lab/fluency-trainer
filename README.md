@@ -70,6 +70,13 @@ Limits to keep in mind: the model sees only the transcript, so on a short or unc
 
 Playful, colourful interface: cream paper with a dot grid, thick outlines, chunky buttons, a colour per tab, and a light or dark switch (top right, remembered in the browser). The Outfit font is bundled in `app/static/fonts` (SIL Open Font License, text included), so nothing is loaded from the internet. Decorative shapes and speech bubbles appear in the margins on wide screens only. Small animations (floating shapes, cards that pop in, confetti when a session or a review ends) are switched off when your device asks for reduced motion, and nothing moves during a recording. Every decorative shape floats gently. At load the app also measures its own frame rate for two seconds; below 45 frames per second it switches the decorative motion off ("calm" mode) and logs a `client.perf_check` event with the measured rate and browser, so you can see in the log where it was slow. Tested in Chromium only: Firefox and Safari were not available here.
 
+## Talking with the partner
+
+- **Who decides that you have finished.** Default: you press "I'm done" (the button is always there). Or "Auto", which you can switch to at any time: it answers when your sentence is finished, using AssemblyAI's end-of-turn signal (it listens to the words and the sound) plus a real voice detector, and it waits longer when you hesitate (after "uh", "and", "because"...). A plain silence timer cut off people who search for their words, so it is only a fallback now.
+- **Voice detector.** Silero VAD, a small neural network that runs in your browser (files in `app/static/vendor/vad`, MIT licensed, about 14 MB, nothing is downloaded at run time). It tells speech from noise, breathing and echo; a loud noise does not count as speech. If it cannot load, the app falls back to a loudness threshold and logs `client.vad_unavailable`.
+- **You can interrupt.** Talk over the partner, or press "Interrupt", and it stops and listens. Headphones work best: with speakers the partner's own voice can come back into the microphone. There is a checkbox to turn it off.
+- The Auto end-of-turn logic was tested for connection and with a simulated microphone, not with a real person talking: tune it with the "patient / natural / quick" choice.
+
 ## Pronunciation from the audio
 
 A speech-to-text transcript tends to guess the word you meant, so it hides mispronunciations. This part scores the audio itself.
