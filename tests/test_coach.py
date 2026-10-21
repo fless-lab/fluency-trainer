@@ -171,3 +171,12 @@ def test_feedback_prompt_receives_pause_markers(tmp_path):
             mock.MockLLM.complete = orig
         assert "[pause " in seen["user"]
     run(make(tmp_path), go)
+
+
+def test_low_confidence_words_are_marked_and_markers_are_stripped_from_quotes():
+    from app.coach import annotate_transcript
+    words = [{"text": "I", "confidence": 0.99}, {"text": "think", "confidence": 0.41}, {"text": "so"}]
+    assert annotate_transcript(words, []) == "I think [unsure 0.41] so"
+    raw = '{"summary":"s","patterns":[{"tag":"t","issue":"i","examples":[{"said":"I think [unsure 0.41] so","better":"b"}]}]}'
+    ex = parse_feedback(raw, "I think so")["patterns"][0]["examples"][0]
+    assert ex["quote_found"] is True and "unsure" not in ex["said"]

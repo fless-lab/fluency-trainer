@@ -664,7 +664,7 @@ function renderCoaching(body, c) {
     ${k.patterns.map((p) => `<div class="card"><div class="tag">${esc(p.tag)}</div><p style="margin:4px 0">${esc(p.issue)}</p>${p.why ? `<p class="small muted" style="margin:0 0 4px">${esc(p.why)}</p>` : ""}${examples(p)}</div>`).join("")}
     ${k.phrases.length ? `<h3 style="margin-top:14px">Phrases to reuse</h3><ul>${k.phrases.map((ph, i) => `<li class="small"><strong>${esc(ph.phrase)}</strong>${ph.use ? ` <span class="muted">${esc(ph.use)}</span>` : ""} <button class="secondary keep" data-i="${i}" style="padding:0 8px">Keep</button></li>`).join("")}</ul>` : ""}
     ${k.focus_next ? `<div class="card due"><div class="tag">Next time, one thing</div><p style="margin:4px 0 0">${esc(k.focus_next)}</p></div>` : ""}
-    <p class="small muted">From ${esc(c.provider)} (${esc(c.model)}). A language model reads the transcript, so it can be wrong or miss things the audio would show${c.provider === "mock" ? ". This one is a placeholder." : "."}</p>`;
+    <p class="small muted">From ${esc(c.provider)} (${esc(c.model)}). A language model reads an automatic transcript, which tends to correct what you said. It can miss pronunciation and grammar slips that only the audio shows, so “no mistake found” does not mean there was none${c.provider === "mock" ? ". This one is a placeholder." : "."}</p>`;
 }
 
 function wireKeep(body, c, sessionId) {
