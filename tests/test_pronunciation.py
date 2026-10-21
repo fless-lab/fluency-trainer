@@ -239,3 +239,28 @@ def test_a_big_change_on_very_few_words_is_not_called_a_trend():
                 for i, th in enumerate((90, 60, 40, 30))]  # falls by 60 points, but only 3 words per session
     th = next(s for s in pr.trends(sessions)["sounds"] if s["sound"] == "th")
     assert th["trend"] is None  # 3 words on each side is not enough to say anything
+
+
+def test_a_weak_word_goes_to_the_notebook_once(tmp_path):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from tests.test_api import record
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        sid = record(c)
+        body = {"kind": "word", "source": "pronunciation", "session_id": sid, "intent": "Say “think” clearly (weak sound: th 38)", "english": "think"}
+        first = c.post("/api/notebook", json=body)
+        again = c.post("/api/notebook", json={**body, "english": "Think"})
+        assert first.status_code == 201 and first.json()["item"]["english"] == "think" and first.json()["item"]["status"] == "learning"
+        assert again.json()["existing"] is True and again.json()["item"]["id"] == first.json()["item"]["id"]
+        assert len(c.get("/api/notebook").json()["items"]) == 1
+
+
+def test_results_stored_before_the_cut_marker_existed_still_hide_half_words():
+    def chunk(words):
+        c = pr.summarize_chunk(_azure(words), 0.0)
+        for w in c["words"]:
+            w.pop("edge")  # the old format had no such key
+        return {**c, "seconds": 28.0}
+    old = {"seconds": 50.0, "unit": "s", "chunks": [chunk([("hello", 90, [("h", 90)]), ("mathematical", 40, [("th", 30)]), ("ifying", 20, [("f", 20)])]),
+                                                     chunk([("fication", 25, [("k", 25)]), ("vision", 45, [("zh", 40)]), ("end", 90, [("n", 90)])])]}
+    assert [w["word"] for w in pr.aggregate([old])["worst_words"]] == ["mathematical", "vision"]  # the cut ifying / fication are gone

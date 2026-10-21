@@ -44,6 +44,23 @@ document.addEventListener("click", (e) => {
   e.preventDefault();  // inside a label this must not tick the box next to it
   sayText(el.dataset.say, el);
 });
+// "Practise later": a word that was hard to say becomes a notebook card, reviewed on the usual spaced schedule
+function noteBtn(word, sounds, sessionId) {
+  const weak = (sounds || []).filter((x) => x.s < 70).slice(0, 2).map((x) => `${x.p} ${Math.round(x.s)}`).join(", ");
+  return `<button class="secondary mini" data-nb-word="${esc(word)}" data-nb-weak="${esc(weak)}" data-nb-session="${esc(sessionId || "")}" title="Add to your notebook to practise it again later">+ Notebook</button>`;
+}
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest && e.target.closest("[data-nb-word]");
+  if (!b || b.disabled) return;
+  e.preventDefault(); b.disabled = true;
+  const word = b.dataset.nbWord, weak = b.dataset.nbWeak;
+  try {
+    const r = await api("/api/notebook", { method: "POST", body: { kind: "word", source: "pronunciation", session_id: b.dataset.nbSession || null, intent: `Say “${word}” clearly${weak ? ` (weak sound: ${weak})` : ""}`, english: word } });
+    b.textContent = r.existing ? "In notebook" : "Added ✓";
+    logEvent("pron_to_notebook", { word, existing: !!r.existing }, b.dataset.nbSession || null);
+  } catch (err) { b.disabled = false; b.textContent = "Not saved"; }
+});
+
 // play a piece of your own recording
 let clipAudio = null;
 document.addEventListener("click", (e) => {
@@ -714,7 +731,7 @@ function renderPron(box, r, detail) {
   const tiles = SCORE_LABELS.filter(([k]) => sm.scores[k] != null).map(([k, label]) => `<div class="chip ${scoreClass(sm.scores[k])}" style="margin-right:6px"><strong>${Math.round(sm.scores[k])}</strong> ${label}</div>`).join("");
   const sounds = (ph) => ph.map((p) => `<span class="chip ${scoreClass(p.s)}" style="padding:0 6px;margin-right:3px">${esc(p.p)} ${Math.round(p.s)}</span>`).join("");
   const words = sm.worst_words.map((w, i) => `<div class="small" style="margin:6px 0"><strong>${sayable(w.word)}</strong> <span class="muted">${Math.round(w.score)}${w.times > 1 ? ` · weak ${w.times} times` : ""}</span>
-      <span class="hear"><button class="secondary mini" data-say="${esc(w.word)}" title="Hear the app say it">Model</button><button class="secondary mini" data-clip="/api/sessions/${esc(detail.id)}/clip?unit=${encodeURIComponent(w.unit)}&t=${w.t}&d=${w.d || 1}" title="Hear yourself say it">You</button></span><br>${sounds(w.sounds)}</div>`).join("");
+      <span class="hear"><button class="secondary mini" data-say="${esc(w.word)}" title="Hear the app say it">Model</button><button class="secondary mini" data-clip="/api/sessions/${esc(detail.id)}/clip?unit=${encodeURIComponent(w.unit)}&t=${w.t}&d=${w.d || 1}" title="Hear yourself say it">You</button>${noteBtn(w.word, w.weak_sounds, detail.id)}</span><br>${sounds(w.sounds)}</div>`).join("");
   const weak = sm.weak_sounds.map((x) => `<li class="small"><strong>/${esc(x.sound)}/</strong> <span class="muted">average ${Math.round(x.mean)} in ${x.count} words${x.words.length ? `, for example ${x.words.map((w) => sayable(w)).join(", ")}` : ""}</span></li>`).join("");
   const earClips = r.ear ? r.ear.clips.map((c) => `<div class="small" style="margin:6px 0"><strong>${sayable(c.word)}</strong> <span class="muted">sounds like</span> ${esc(c.heard)}<br>${sayQuoted(c.issue)}${c.fix ? `<br><span class="muted">Try:</span> ${sayQuoted(c.fix)}` : ""}</div>`).join("") : "";
   const ear = r.ear ? `<p class="small muted" style="margin:10px 0 0">What an audio model heard when it listened to those words (${esc(r.ear.model)}):</p>${earClips}${r.ear.overall ? `<p class="small">${esc(r.ear.overall)}</p>` : ""}<p class="small muted">An AI model listening is less reliable than the scores above and can be wrong about a word. Trust a tip only if you can hear it yourself: click a word to hear the app say it, and “You” to hear yourself.</p>`
@@ -743,7 +760,7 @@ function renderLesson(box, L, detail) {
       <p style="margin:6px 0">${sayQuoted(f.explain)}</p>
       ${f.how ? `<p class="small" style="margin:6px 0"><strong>How:</strong> ${sayQuoted(f.how)}</p>` : ""}
       ${f.pairs.length ? `<p class="small" style="margin:6px 0"><span class="muted">Hear the difference:</span> ${f.pairs.map(([a, b]) => `${sayable(a)} / ${sayable(b)}`).join(" &nbsp;·&nbsp; ")}</p>` : ""}
-      ${f.clips.length ? `<p class="small" style="margin:6px 0"><span class="muted">Your words:</span> ${f.clips.map((c) => `${sayable(c.word)} ${clipBtn(c)}`).join(" &nbsp; ")}</p>` : ""}
+      ${f.clips.length ? `<p class="small" style="margin:6px 0"><span class="muted">Your words:</span> ${f.clips.map((c) => `${sayable(c.word)} ${clipBtn(c)} ${noteBtn(c.word, [], detail.id)}`).join(" &nbsp; ")}</p>` : ""}
       ${f.sentences.length ? `<p class="small muted" style="margin:8px 0 2px">Say these out loud (click to hear them first):</p><ul style="margin:0">${f.sentences.map((x) => `<li class="small">${sayable(x)}</li>`).join("")}</ul>` : ""}
     </div>`).join("");
   box.innerHTML = `<h3>Your lesson</h3>${focus}${L.advice ? `<div class="card due"><div class="tag">This week</div><p style="margin:4px 0 0">${esc(L.advice)}</p></div>` : ""}
@@ -941,7 +958,7 @@ async function pronunciationProgressHtml() {
     return `<tr><td><strong>/${esc(x.ipa)}/</strong> <span class="muted small">${esc(x.sound)}</span></td><td class="num">${Math.round(x.mean)}</td><td class="muted">${spark(x.points.map((q) => q.mean), 90, 22)}</td>
       <td>${a ? `<span class="chip ${a[1]}" title="${esc(a[2])}">${a[0]} ${x.delta >= 0 ? "+" : ""}${x.delta}</span>` : '<span class="small muted">too early</span>'}</td><td class="num small muted">${x.sessions}</td></tr>`;
   }).join("");
-  const recurring = t.recurring_words.map((w) => `<span style="display:inline-block;margin:3px 10px 3px 0">${sayable(w.word)} <span class="small muted">${w.sessions} sessions · ${Math.round(w.mean)}</span> <button class="secondary mini" data-clip="/api/sessions/${esc(w.last.id)}/clip?unit=${encodeURIComponent(w.last.unit)}&t=${w.last.t}&d=${w.last.d || 1}" title="Hear yourself, last time">You</button></span>`).join("");
+  const recurring = t.recurring_words.map((w) => `<span style="display:inline-block;margin:3px 10px 3px 0">${sayable(w.word)} <span class="small muted">${w.sessions} sessions · ${Math.round(w.mean)}</span> <button class="secondary mini" data-clip="/api/sessions/${esc(w.last.id)}/clip?unit=${encodeURIComponent(w.last.unit)}&t=${w.last.t}&d=${w.last.d || 1}" title="Hear yourself, last time">You</button> ${noteBtn(w.word, [], w.last.id)}</span>`).join("");
   return `${head}<p class="small muted">The score of each sound averaged over the words of each session (0 to 100). A direction is only given after three sessions, with at least 8 words on each side of the comparison, and only when the change is 8 points or more.</p>
     <div class="row" style="gap:10px;margin:8px 0">${tiles}</div>
     ${sounds ? `<div class="card scroll"><table><thead><tr><th>Sound</th><th>Average</th><th>Over time</th><th>Change</th><th>Sessions</th></tr></thead><tbody>${sounds}</tbody></table></div>` : ""}

@@ -172,7 +172,11 @@ def aggregate(units: list[dict[str, Any]]) -> dict[str, Any]:
     seconds = 0.0
     for u in units:
         seconds += u.get("seconds", 0.0)
-        for c in u.get("chunks", []):
+        chunks = u.get("chunks", [])
+        for ci, c in enumerate(chunks):
+            for wi, w in enumerate(c["words"]):  # scored before the cut marker existed: where a cut was made, the edge words are suspect
+                if "edge" not in w:
+                    w["edge"] = (wi == 0 and ci > 0) or (wi == len(c["words"]) - 1 and ci < len(chunks) - 1)
             n = len(c["words"])
             for k, v in (c.get("scores") or {}).items():
                 if isinstance(v, (int, float)) and n:

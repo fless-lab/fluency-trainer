@@ -89,6 +89,8 @@ Playful, colourful interface: cream paper with a dot grid, thick outlines, chunk
 
 The Progress tab ends with a pronunciation section built from every scored session (conversations count too): the three scores per session with a small curve, the weakest sounds with their own curve, and the words that are weak in several sessions, each with Model and You buttons (your last recording of it). A direction (better, worse, steady) is only given for a sound after three sessions, with at least 8 words on each side of the comparison, and only when the change is 8 points or more: below that, a score moves just because the words or the topic changed. Sessions with fewer than 30 words are ignored.
 
+**Practise later.** Every weak word (in the pronunciation card, in the lesson, and in the list of words that keep coming back) has a "+ Notebook" button. It adds the word to your notebook as a card, reviewed on the same widening schedule as your expressions, with the word clickable to hear. A word already in the notebook is not added twice.
+
 ## Pronunciation from the audio
 
 A speech-to-text transcript tends to guess the word you meant, so it hides mispronunciations. This part scores the audio itself.

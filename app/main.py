@@ -103,7 +103,7 @@ class NotebookIn(BaseModel):
     intent: str = Field(min_length=2, max_length=400)
     english: str | None = Field(default=None, max_length=300)
     session_id: str | None = Field(default=None, max_length=64)
-    source: Literal["manual", "coach", "prep"] = "manual"
+    source: Literal["manual", "coach", "prep", "pronunciation"] = "manual"
 
 
 class TargetsIn(BaseModel):
@@ -1088,6 +1088,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if body.session_id:
             need_session(body.session_id)
         english = clean(body.english or "", 300) or None
+        if body.source == "pronunciation" and english:  # a word already in the notebook is not added twice
+            have = next((i for i in db.list_notebook() if i["kind"] == "word" and (i["english"] or "").lower() == english.lower()), None)
+            if have:
+                return {"item": have, "existing": True}
         item_id = db.add_notebook({
             "created_at": now_iso(), "kind": body.kind, "source": body.source, "session_id": body.session_id,
             "intent": clean(body.intent, 400), "english": english,
