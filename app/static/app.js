@@ -1052,17 +1052,31 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   const setPhase = (phase, text) => { pill.dataset.phase = phase; stateEl.textContent = text; };
   // who decides that you have finished: you (button) or the app (a pause), switchable at any time
   let auto = patienceMs > 0; const basePatience = patienceMs || 4000;
-  const quietAfterComplete = Math.round(basePatience * 0.3);  // patient 1.8 s, natural 1.2 s, quick 0.75 s of real silence after a finished sentence
+  let maxInnerPause = 0;  // the longest pause you made in the middle of an answer so far: a hesitant speaker gets more time
+  const quietAfterComplete = () => Math.max(Math.round(basePatience * 0.45), Math.min(Math.round(maxInnerPause * 1.2), 4500));  // patient 2.7 s, natural 1.8 s, quick 1.1 s, at least
   const drawMode = () => { $("#m-manual", stage).classList.toggle("on", !auto); $("#m-auto", stage).classList.toggle("on", auto); };
   $("#m-manual", stage).addEventListener("click", () => { auto = false; drawMode(); });
   $("#m-auto", stage).addEventListener("click", () => { auto = true; drawMode(); });
   drawMode();
   // a hesitating speaker is not finished: wait longer after a filler or a connector, answer sooner after a full stop
-  const UNFINISHED = /(^|\s)(uh|um|er|eh|like|and|but|so|because|or|the|a|an|to|of|that|which|who|with|i mean|you know|i think|kind of|sort of)[\s,.…-]*$/i;
+  // A sentence that ends on one of these cannot be finished, even if the recogniser put a full stop after it
+  const STRONG = "the a an this that these those my your his her its our their some any to of in on at by for from with about into over and but or because if when while although so than as not can could will would shall should may might must is are was were be been am have has had do does did i you he she we they it uh um er eh like";
+  const lastWord = (t) => (t.toLowerCase().replace(/[^a-z' ]+/g, " ").trim().split(/\s+/).pop() || "");
+  const STRONG_SET = new Set(STRONG.split(" "));
+  const endsSentence = (t) => /[.?!]["')\]]?\s*$/.test(t) && !/(\.\.\.|…)\s*$/.test(t);
+  // "so" and "it" can end a real sentence ("I think so."), so they only count when there is no full stop
+  const WEAK_OK = new Set(["so", "it", "i", "you", "like", "that", "not", "do", "did", "does", "can", "will", "are", "is", "was", "were", "am", "have", "has", "had", "be"]);
+  const unfinished = (t) => {
+    if (!t) return false;
+    const w = lastWord(t), words = t.split(/\s+/).length;
+    if (/[,;:…-]\s*$/.test(t) || /(\.\.\.)\s*$/.test(t)) return true;
+    if (!endsSentence(t)) return STRONG_SET.has(w) || words < 3 || /(^|\s)(i mean|you know|kind of|sort of)$/i.test(t.toLowerCase());
+    return STRONG_SET.has(w) && !WEAK_OK.has(w);
+  };
   const patienceFor = (text) => {
     if (!text) return basePatience;
-    if (UNFINISHED.test(text) || /[,…]\s*$/.test(text)) return Math.min(basePatience * 2, 10000);
-    if (/[.?!]\s*$/.test(text)) return Math.max(basePatience * 0.6, 1500);
+    if (unfinished(text)) return Math.min(basePatience * 2, 10000);
+    if (endsSentence(text)) return Math.max(basePatience * 0.6, 1500);
     return basePatience;
   };
   const add = (who, text) => { const d = document.createElement("div"); d.className = `say-${who}`; d.textContent = text; say.appendChild(d); say.scrollTop = say.scrollHeight; return d; };
@@ -1084,11 +1098,24 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   await sleep(300);
   let ambient = 0; for (let i = 0; i < 6; i++) { ambient = Math.max(ambient, level()); await sleep(50); }
   const threshold = Math.min(0.08, Math.max(0.02, ambient * 3));
-  let loudMs = 0;
-  const watch = setInterval(() => {  // draws the microphone level, and lets you interrupt the partner by talking over it
-    const lv = level();
+  // Interrupting by voice: you have to be clearly louder than the partner's own voice coming back through the microphone
+  // (the peaks of its level, measured while it talks) and sound like speech, in most of the last 0.8 s. Speech has gaps, so
+  // it is a count over a window and not an unbroken stretch. With headphones the echo is close to nothing.
+  let echoPeak = 0, partnerSince = 0, recent = [];
+  const watch = setInterval(() => {  // also draws the microphone level
+    const lv = level(), nowMs = performance.now();
     meter.style.width = `${Math.min(100, Math.round((lv / Math.max(threshold * 3, 0.06)) * 100))}%`;
-    if (bargeIn && partnerPlayer && (vadOk ? vadProb > 0.8 : lv > threshold * 2)) { loudMs += 80; if (loudMs >= 320) { loudMs = 0; logEvent("conv_barge_in", {}, sid); interrupt(); } } else loudMs = 0;
+    if (!partnerPlayer) { partnerSince = 0; echoPeak = 0; recent = []; return; }
+    if (!partnerPlayer.isPlaying()) { partnerSince = 0; recent = []; return; }  // measure the echo only while its voice is really playing
+    if (!partnerSince) partnerSince = nowMs;
+    const calibrating = nowMs - partnerSince < 700;
+    const floor = Math.max(threshold * 1.5, echoPeak * 1.8);
+    const loud = (vadOk ? vadProb > 0.5 : true) && lv > floor;
+    if (calibrating || lv <= echoPeak * 1.3) echoPeak = Math.max(echoPeak * 0.998, lv);  // much louder than the echo's peaks: that is you, not the echo
+    recent.push(loud); if (recent.length > 10) recent.shift();
+    if (bargeIn && !calibrating && recent.length === 10 && recent.filter(Boolean).length >= 6) {
+      recent = []; logEvent("conv_barge_in", { level: Math.round(lv * 1000) / 1000, echo_peak: Math.round(echoPeak * 1000) / 1000 }, sid); interrupt();
+    }
   }, 80);
   const isVoice = () => (vadOk ? vadProb > 0.5 : level() > threshold);
   const t0 = performance.now();
@@ -1096,22 +1123,24 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
 
   // The partner's sentences are played in order, as they arrive.
   const makePlayer = () => {
-    const queue = []; let finished = false, wake = null, bubble = null, text = "", cur = {}, stopped = false;
+    const queue = []; let finished = false, wake = null, bubble = null, text = "", cur = {}, stopped = false, playing = false;
     const run = (async () => {
       for (;;) {
         if (queue.length) {
           const sn = queue.shift();
           if (!bubble) bubble = add("partner", ""); text = (text + " " + sn.text).trim(); bubble.textContent = text; say.scrollTop = say.scrollHeight;
           note.textContent = sn.audio_url ? "" : (sn.voice_note || "");
+          playing = true;
           if (sn.audio_url) await playUrl(sn.audio_url, () => { note.textContent = "Your browser blocked the sound. Click anywhere, then it works."; }, cur);
           else await speakBrowser(sn.text);
+          playing = false;
           if (stopped) break;
         } else if (finished) break;
         else await new Promise((r) => { wake = r; });
       }
     })();
     const stop = () => { stopped = true; finished = true; queue.length = 0; if (cur.stop) cur.stop(); window.speechSynthesis && window.speechSynthesis.cancel(); if (wake) { const w = wake; wake = null; w(); } };
-    return { stop, push: (sn) => { if (!stopped) queue.push(sn); if (wake) { const w = wake; wake = null; w(); } }, end: () => { finished = true; if (wake) { const w = wake; wake = null; w(); } }, done: run };
+    return { stop, isPlaying: () => playing, push: (sn) => { if (!stopped) queue.push(sn); if (wake) { const w = wake; wake = null; w(); } }, end: () => { finished = true; if (wake) { const w = wake; wake = null; w(); } }, done: run };
   };
   let partnerEndedAt = performance.now();
   setPhase("partner", "Your partner is speaking…"); interruptBtn.hidden = false;
@@ -1132,18 +1161,18 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
       const now = performance.now();
       // the first 0.35 s after the partner stops are ignored: its own voice can still come back through the microphone
       const echoGrace = !bargedIn && now - turnStart < 350;
-      if (!echoGrace && isVoice()) { voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 240) { spoke = true; firstSpeechAt = now - 240; setPhase("you", auto ? "Listening… I answer when you pause." : "Listening… press “I'm done” when you finish."); } }
+      if (!echoGrace && isVoice()) { if (spoke && now - lastVoiceAt >= 600) maxInnerPause = Math.max(maxInnerPause, now - lastVoiceAt); voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 240) { spoke = true; firstSpeechAt = now - 240; setPhase("you", auto ? "Listening… I answer when you pause." : "Listening… press “I'm done” when you finish."); } }
       if (auto && spoke) {
         // like a voice assistant: answer soon after a finished sentence, wait longer when you are still searching for words
         const heard = liveOk ? live.heard() : "", quiet = now - lastVoiceAt;
         if (liveOk && !heard) { /* the detector heard something but no word was recognised: noise or echo, keep waiting */ }
-        else if (liveOk && live.completeAt && quiet > quietAfterComplete && !UNFINISHED.test(heard)) { endReason = "sentence_complete"; break; }
+        else if (liveOk && live.completeAt && endsSentence(heard) && !unfinished(heard) && quiet > quietAfterComplete()) { endReason = "sentence_complete"; break; }
         else if (quiet > patienceFor(heard)) { endReason = "patience"; break; }
       }
       if (now - turnStart > 150000) { endReason = "cap"; break; }
     }
     const durationS = (performance.now() - turnStart) / 1000;
-    logEvent("conv_turn_end", { reason: doneNow ? "button" : endReason, auto, spoke, voice_ms: voiceMs, seconds: Math.round(durationS * 10) / 10, heard_words: liveOk ? live.heard().split(/\s+/).filter(Boolean).length : null, neural_vad: vadOk }, sid);
+    logEvent("conv_turn_end", { reason: doneNow ? "button" : endReason, auto, last_words: liveOk ? live.heard().split(/\s+/).slice(-6).join(" ") : null, inner_pause_ms: Math.round(maxInnerPause), spoke, voice_ms: voiceMs, seconds: Math.round(durationS * 10) / 10, heard_words: liveOk ? live.heard().split(/\s+/).filter(Boolean).length : null, neural_vad: vadOk }, sid);
     await new Promise((resolve) => { rec.onstop = resolve; if (rec.state !== "inactive") rec.stop(); });
     if (over) break;
     if (!spoke) { if (ending) break; continue; }  // nothing said: keep waiting, nothing is sent
@@ -1198,7 +1227,7 @@ async function conversationCard() {
   return `<div class="card"><h3>Talk with a partner</h3><p class="muted small">A spoken conversation. The partner asks, you answer out loud, you choose whether you press “I'm done” or it answers by itself when your sentence is finished (and waits when you hesitate), and you can talk over it to interrupt. Your speech is measured like any other session, then you get the same feedback. ${ready ? "" : `<span class="err">Not available: ${esc(cfg.llm_error || "no language model")}</span>`}</p>
     <div class="row"><select id="conv-scn">${SCENARIOS.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}<option value="">My own scenario…</option></select><select id="conv-len"><option value="5">5 min</option><option value="10" selected>10 min</option><option value="20">20 min</option></select><select id="conv-wait" title="Who decides that you have finished speaking"><option value="0" selected>I press “I'm done”</option><option value="6000">Auto, patient</option><option value="4000">Auto, natural</option><option value="2500">Auto, quick</option></select></div>
     <div class="row" style="margin-top:8px"><input type="text" id="conv-custom" placeholder="Describe the situation" size="50" hidden><button class="primary" id="conv-start" ${ready ? "" : "disabled"}>Start</button></div>
-    <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-barge" checked> Let me interrupt the partner by talking over it (works best with headphones)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label><p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
+    <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-barge"> Let me interrupt the partner by talking over it (headphones only: with speakers its own voice can cut it off)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label><p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
 }
 
 function wireConversationCard() {
