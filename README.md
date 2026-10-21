@@ -43,6 +43,8 @@ Fluency also breaks when you know a word but cannot get to it in time, or lack t
 
 Review is spoken. The Notebook tab shows what you wanted to say, you say it aloud in English, reveal the answer, and report honestly: said it without stopping, hesitated, or could not. The next review moves out (same day, then 1, 3, 7, 14 and 30 days), stays at the same interval, or goes back to the start. Phrases from the feedback can be kept with one click. The notebook works without any model: you can add and choose versions by hand. Every add, suggestion and review is in the event log, and the tables are in the export.
 
+The session screen lists the longest silences in the middle of a sentence (0.7 s or more) with the words around them, so you do not have to hunt for where you got stuck: click one, say what you wanted to say, or ask the model to guess from the surrounding words. The feedback request also receives the transcript with those long silences marked in place (for example `died at 30 [pause 1.4s] years old`), so it can point at where you searched for words. Still only text goes to the provider, never audio.
+
 Limits to keep in mind: the model sees only the transcript, so on a short or unclear fragment it may guess your intent wrongly, which is why you write the intent yourself. The review is a self-check, not a pronunciation score. Suggestions count against the same `COACH_MAX_PER_DAY` cap as feedback. Not run against the live providers yet.
 
 ## Tracking and safety

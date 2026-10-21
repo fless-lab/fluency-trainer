@@ -140,3 +140,34 @@ def test_anthropic_request_shape_and_errors(monkeypatch):
     _patch_client(monkeypatch, mod, lambda req: httpx.Response(529, text="overloaded"))
     with pytest.raises(LLMError, match="529"):
         asyncio.run(AnthropicLLM("KEY", "m").complete("s", "u", 10))
+
+
+def test_annotated_transcript_marks_long_pauses_and_quotes_still_verify():
+    from app.coach import PAUSE_MARK_MS, annotate_transcript
+    words = [{"text": "my"}, {"text": "father"}, {"text": "died"}, {"text": "at"}, {"text": "thirty"}, {"text": "years"}]
+    pauses = [{"before_word_index": 5, "duration_ms": 1400}, {"before_word_index": 2, "duration_ms": PAUSE_MARK_MS - 1}]
+    text = annotate_transcript(words, pauses)
+    assert text == "my father died at thirty [pause 1.4s] years"  # short silences are not shown
+    raw = ('{"summary":"s","patterns":[{"tag":"t","issue":"i","examples":'
+           '[{"said":"at thirty [pause 1.4s] years","better":"at thirty years old"}]}]}')
+    parsed = parse_feedback(raw, "my father died at thirty years")
+    assert parsed["patterns"][0]["examples"][0]["quote_found"] is True  # markers are stripped before checking
+    assert "[pause" not in parsed["patterns"][0]["examples"][0]["said"]
+
+
+def test_feedback_prompt_receives_pause_markers(tmp_path):
+    seen = {}
+    def go(c):
+        sid = record(c)
+        import app.llm.mock as mock
+        orig = mock.MockLLM.complete
+        async def spy(self, system, user, max_tokens):
+            seen["user"] = user
+            return await orig(self, system, user, max_tokens)
+        mock.MockLLM.complete = spy
+        try:
+            assert c.post(f"/api/sessions/{sid}/coach").status_code == 200
+        finally:
+            mock.MockLLM.complete = orig
+        assert "[pause " in seen["user"]
+    run(make(tmp_path), go)

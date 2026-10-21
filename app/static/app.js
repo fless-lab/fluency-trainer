@@ -463,33 +463,43 @@ function itemCard(it, onChange) {
 async function setupGaps(root, detail) {
   const box = $("#gaps", root);
   if (!box || detail.status !== "done") return;
-  box.innerHTML = `<h3>Where you got stuck</h3><p class="muted small">Click the word where you stopped or went around something, then write what you wanted to say (any language). It goes into your notebook with natural English ways to say it.</p><div id="gap-form"></div><div id="gap-items"></div>`;
+  box.innerHTML = `<h3>Where you got stuck</h3><p class="muted small">The longest silences in the middle of a sentence are listed below: they often mark a word or phrase you were looking for. Click one, or click any word in the transcript, then write what you wanted to say (any language). You can also ask for a guess from the words around it.</p><div id="stuck"></div><div id="gap-form"></div><div id="gap-items"></div>`;
   const items = $("#gap-items", box);
   const draw = (list) => { items.innerHTML = ""; list.filter((i) => i.status !== "archived").forEach((it) => items.appendChild(itemCard(it, () => load()))); };
   const load = async () => { try { draw((await api(`/api/notebook?session_id=${detail.id}`)).items); } catch (_) {} };
   await load();
-  $("#tr", root).addEventListener("click", (e) => {
-    const w = e.target.closest(".w");
-    if (!w) return;
-    const idx = Number(w.dataset.i);
-    $("#tr", root).querySelectorAll(".w.sel").forEach((x) => x.classList.remove("sel"));
-    w.classList.add("sel");
+
+  const words = detail.words || [];
+  const around = (i) => `${words.slice(Math.max(0, i - 4), i).map((w) => w.text).join(" ")} … ${words.slice(i, i + 3).map((w) => w.text).join(" ")}`;
+  const stuck = (detail.pauses || []).filter((p) => p.type === "mid_clause" && p.duration_ms >= 700).sort((a, b) => b.duration_ms - a.duration_ms).slice(0, 6).sort((a, b) => a.before_word_index - b.before_word_index);
+  $("#stuck", box).innerHTML = stuck.length
+    ? stuck.map((p) => `<button class="secondary stuck-pt" data-i="${p.before_word_index}" style="margin:0 6px 6px 0;text-align:left"><span class="chip long">${(p.duration_ms / 1000).toFixed(1)}s</span> ${esc(around(p.before_word_index))}</button>`).join("")
+    : `<p class="muted small">No long mid-sentence silence in this session.</p>`;
+
+  const selectWord = (idx) => {
+    const tr = $("#tr", root);
+    tr.querySelectorAll(".w.sel").forEach((x) => x.classList.remove("sel"));
+    const w = tr.querySelector(`.w[data-i="${idx}"]`);
+    if (w) w.classList.add("sel");
     const form = $("#gap-form", box);
-    form.innerHTML = `<div class="card"><p class="small" style="margin:0 0 6px">Stuck at: <strong>${esc(w.textContent)}</strong></p><input type="text" id="gap-intent" placeholder="What did you want to say?" style="width:100%" maxlength="400"><div class="row" style="margin-top:8px"><button class="primary" id="gap-save">Add to notebook</button><span class="err small" id="gap-err"></span></div></div>`;
+    form.innerHTML = `<div class="card"><p class="small" style="margin:0 0 6px">Stuck at: <strong>${esc(around(idx))}</strong></p><input type="text" id="gap-intent" placeholder="What did you want to say?" style="width:100%" maxlength="400"><div class="row" style="margin-top:8px"><button class="primary" id="gap-save">Add to notebook</button><button class="secondary" id="gap-guess" title="The model guesses from the words around the silence">I do not remember, guess</button><span class="err small" id="gap-err"></span></div></div>`;
     $("#gap-intent", form).focus();
-    $("#gap-save", form).addEventListener("click", async () => {
-      const intent = $("#gap-intent", form).value.trim();
+    const save = async (intent, guessed) => {
       if (intent.length < 2) { $("#gap-err", form).textContent = "Write a few words."; return; }
       try {
         const r = await api(`/api/sessions/${detail.id}/gaps`, { method: "POST", body: { intent, word_index: idx } });
-        logEvent("gap_added", { word_index: idx }, detail.id);
-        form.innerHTML = ""; w.classList.remove("sel");
+        logEvent("gap_added", { word_index: idx, guessed }, detail.id);
+        form.innerHTML = ""; if (w) w.classList.remove("sel");
         const llm = (STATE && STATE.llm) || {};
         if (llm.configured) { try { await api(`/api/notebook/${r.item.id}/suggest`, { method: "POST", body: {} }); } catch (_) {} }
         await load();
       } catch (e) { $("#gap-err", form).textContent = e.message; }
-    });
-  });
+    };
+    $("#gap-save", form).addEventListener("click", () => save($("#gap-intent", form).value.trim(), false));
+    $("#gap-guess", form).addEventListener("click", () => save("Not sure what I wanted to say. Infer it from the words around the silence.", true));
+  };
+  $("#tr", root).addEventListener("click", (e) => { const w = e.target.closest(".w"); if (w) selectWord(Number(w.dataset.i)); });
+  box.querySelectorAll(".stuck-pt").forEach((b) => b.addEventListener("click", () => selectWord(Number(b.dataset.i))));
 }
 
 async function renderNotebook() {

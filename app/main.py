@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from . import APP_VERSION
 from .notebook import KINDS, RESULTS, build_suggest_messages, clean, context_around, now_iso, parse_suggestions, schedule_after
-from .coach import COACH_VERSION, MIN_WORDS, build_messages, parse_feedback
+from .coach import COACH_VERSION, MIN_WORDS, annotate_transcript, build_messages, parse_feedback
 from .config import Settings, load_settings
 from .db import DB
 from .eventlog import EventLog, utcnow
@@ -469,7 +469,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(429, f"Daily cap of {settings.coach_max_per_day} feedback requests reached (COACH_MAX_PER_DAY).")
             if len(s["transcript_text"].split()) < MIN_WORDS:
                 raise HTTPException(422, f"too little speech to give useful feedback (under {MIN_WORDS} words)")
-            system, user = build_messages(s, db.metrics_for(sid, METRICS_VERSION), s["transcript_text"])
+            annotated = None
+            tr = load_transcript(s)
+            if tr and tr.get("words"):
+                annotated = annotate_transcript(tr["words"], compute_metrics(tr["words"])["pauses"])
+            system, user = build_messages(s, db.metrics_for(sid, METRICS_VERSION), s["transcript_text"], annotated)
             events.write("coach.start", sid, provider=llm.name, model=llm.model, version=COACH_VERSION)
             started = time.monotonic()
             try:
