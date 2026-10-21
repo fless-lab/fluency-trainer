@@ -212,3 +212,11 @@ button.primary:hover { rotate: -1deg; }
 body.busy .deco { animation-play-state: paused; }
 body.calm .deco, body.calm main > *, body.calm h2, body.calm .brand { animation: none; }
 body.calm .confetti { display: none; }
+
+/* voice conversation */
+.saybox { max-height: 38vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; margin: 8px 0 14px; padding: 4px; }
+.say-partner, .say-user { max-width: 82%; padding: 10px 16px; border: 3px solid var(--ink); border-radius: 18px; box-shadow: 3px 3px 0 var(--ink); line-height: 1.35; animation: bounce-in .35s ease-out both; }
+.say-partner { align-self: flex-start; background: var(--sky, #bfe3ff); color: #1d1b38; }
+.say-user { align-self: flex-end; background: var(--mint, #c8f2d4); color: #1d1b38; }
+.clock.small { font-size: 28px; margin: 4px 0 10px; }
+@media (prefers-reduced-motion: reduce) { .say-partner, .say-user { animation: none; } }

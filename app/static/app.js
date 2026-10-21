@@ -166,7 +166,9 @@ async function renderToday() {
   }
   html += `<div class="card"><h3>Free monologue</h3><p class="muted small">Talk about anything. Logged and measured like the tests, but kept out of the checkpoint comparison.</p><div class="row"><input type="text" id="free-topic" placeholder="Topic (optional)" size="40"><select id="free-length"><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option></select><button class="primary" id="free-start">Start</button></div></div>`;
   html += `<div class="card"><h3>4/3/2 drill</h3><p class="muted small">Tell the same story three times, in 4, then 3, then 2 minutes. Same content each time, nothing new added. The shrinking time pushes you to find your words faster. About 10 minutes in all. This is training, not a test: it is kept out of the checkpoint comparison.</p><div class="row"><select id="drill-topic">${(STATE.drill_topics || []).map((t) => `<option value="${esc(t.text)}">${esc(t.text)}</option>`).join("")}<option value="">My own topic…</option></select></div><div class="row" style="margin-top:8px"><input type="text" id="drill-custom" placeholder="Your topic" size="50" hidden><button class="primary" id="drill-start">Start</button></div></div>`;
+  html += await conversationCard();
   view.innerHTML = html;
+  wireConversationCard();
   $("#drill-topic").addEventListener("change", (e) => { const c = $("#drill-custom"); c.hidden = e.target.value !== ""; if (!c.hidden) c.focus(); });
   $("#drill-start").addEventListener("click", () => {
     const chosen = $("#drill-topic").value || $("#drill-custom").value.trim();
@@ -823,3 +825,144 @@ function checkSmoothness() {
   logEvent("page_loaded", { ua: navigator.userAgent });
   show("today");
 })();
+
+// ---------------------------------------------------------------- voice conversation
+const SCENARIOS = [
+  "A relaxed chat about my week and my plans",
+  "A job interview for a role in my field",
+  "Explaining my work to someone who knows nothing about it",
+  "Ordering food and asking about the menu in a restaurant abroad",
+  "Giving my opinion on a news topic and defending it",
+];
+
+function speakBrowser(text) {
+  return new Promise((resolve) => {
+    if (!window.speechSynthesis) { resolve(); return; }
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-US"; u.rate = 0.95;
+    const guard = setTimeout(resolve, text.split(/\s+/).length * 600 + 4000);
+    u.onend = u.onerror = () => { clearTimeout(guard); resolve(); };
+    window.speechSynthesis.cancel(); window.speechSynthesis.speak(u);
+  });
+}
+
+function playUrl(url, onBlocked) {
+  return new Promise((resolve) => {
+    const a = new Audio(url);
+    a.onended = a.onerror = () => resolve();
+    a.play().catch(() => { onBlocked && onBlocked(); resolve(); });
+  });
+}
+
+async function runConversation(scenario, minutes, patienceMs) {
+  const info = { ua: navigator.userAgent, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, screen: `${screen.width}x${screen.height}` };
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { alert(`The microphone is not available (${e.name}). Allow microphone access for this page and try again.`); return; }
+  const box = openOverlay(`<button class="secondary" id="cancel">Cancel</button><p class="tag" style="margin-top:24px">Conversation</p><div class="big-topic">${esc(scenario || "A relaxed chat.")}</div><div id="stage"><p class="muted">Starting…</p></div>`);
+  const stage = $("#stage", box);
+  let sid = null, over = false, doneNow = false, ending = false;
+  const stopMic = () => stream.getTracks().forEach((t) => t.stop());
+  $("#cancel", box).addEventListener("click", () => { over = true; stopMic(); window.speechSynthesis && window.speechSynthesis.cancel(); closeOverlay(); show(currentTab); });
+  let first;
+  try { first = await api("/api/conversations", { method: "POST", body: { scenario, minutes, client_info: info } }); }
+  catch (e) { stopMic(); stage.innerHTML = `<p class="err">Could not start: ${esc(e.message)}</p>`; return; }
+  sid = first.id;
+  logEvent("conv_opened", { patience_ms: patienceMs, minutes }, sid);
+  stage.innerHTML = `<div id="say" class="saybox"></div><p class="muted" id="state"></p><div class="clock small" id="clock">00:00</div><div class="row"><button class="primary" id="done-turn" hidden>I'm done talking</button><button class="secondary" id="end">End and get feedback</button></div><p class="small muted" id="vnote"></p>`;
+  const say = $("#say", stage), stateEl = $("#state", stage), doneBtn = $("#done-turn", stage);
+  const add = (who, text) => { const d = document.createElement("div"); d.className = `say-${who}`; d.textContent = text; say.appendChild(d); say.scrollTop = say.scrollHeight; };
+  $("#end", stage).addEventListener("click", () => { ending = true; doneNow = true; });
+  doneBtn.addEventListener("click", () => { doneNow = true; });
+
+  // voice-activity detection: simple loudness threshold, calibrated on the room noise
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  try { await ctx.resume(); } catch (_) {}
+  const analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+  const buf = new Float32Array(analyser.fftSize);
+  const level = () => { analyser.getFloatTimeDomainData(buf); let s = 0; for (const v of buf) s += v * v; return Math.sqrt(s / buf.length); };
+  await sleep(400);
+  let ambient = 0; for (let i = 0; i < 6; i++) { ambient = Math.max(ambient, level()); await sleep(50); }
+  const threshold = Math.min(0.08, Math.max(0.02, ambient * 3));
+  const t0 = performance.now();
+  const tick = setInterval(() => { const c = $("#clock", stage); if (c) c.textContent = mmss((performance.now() - t0) / 1000); }, 500);
+
+  let partnerEndedAt = performance.now();
+  const hear = async (turn) => {
+    add("partner", turn.text);
+    stateEl.textContent = "Your partner is speaking…"; doneBtn.hidden = true;
+    const note = $("#vnote", stage); if (note) note.textContent = turn.audio_url ? "" : (turn.voice_note || "");
+    if (turn.audio_url) await playUrl(turn.audio_url, () => { if (note) note.textContent = "Your browser blocked the sound. Click anywhere, then it works."; });
+    else await speakBrowser(turn.text);
+    partnerEndedAt = performance.now();
+  };
+  await hear(first.turn);
+
+  while (!over) {
+    // one user turn: wait for speech, record, stop after a patient silence or on the button
+    stateEl.textContent = "Your turn. Take your time."; doneBtn.hidden = false; doneNow = false;
+    const rec = new MediaRecorder(stream, pickMime() ? { mimeType: pickMime() } : undefined);
+    const chunks = []; rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    rec.start(500);
+    const turnStart = performance.now();
+    let spoke = false, firstSpeechAt = null, lastVoiceAt = performance.now(), voiceMs = 0;
+    while (!over && !doneNow) {
+      await sleep(80);
+      const now = performance.now();
+      if (level() > threshold) { voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 160) { spoke = true; firstSpeechAt = now - 160; stateEl.textContent = "Listening…"; } }
+      if (spoke && now - lastVoiceAt > patienceMs) break;
+      if (now - turnStart > 150000) break;
+    }
+    const durationS = (performance.now() - turnStart) / 1000;
+    await new Promise((resolve) => { rec.onstop = resolve; if (rec.state !== "inactive") rec.stop(); });
+    if (over) break;
+    if (!spoke) { if (ending) break; continue; }  // nothing said: keep waiting without sending anything
+    stateEl.textContent = "…"; doneBtn.hidden = true;
+    const fd = new FormData();
+    fd.append("file", new Blob(chunks, { type: rec.mimeType || "audio/webm" }), "turn.webm");
+    fd.append("duration_s", String(durationS)); fd.append("mime", (rec.mimeType || "audio/webm").split(";")[0]);
+    fd.append("latency_ms", String(Math.round(firstSpeechAt - partnerEndedAt)));
+    let out;
+    try { const r = await fetch(`/api/conversations/${sid}/turn`, { method: "POST", body: fd }); out = await r.json(); if (!r.ok) throw new Error(out.detail || r.statusText); }
+    catch (e) { stateEl.innerHTML = `<span class="err">${esc(e.message)}</span> Say it again, or end the conversation.`; logEvent("conv_turn_failed", { error: String(e) }, sid); if (ending) break; continue; }
+    if (out.empty) { stateEl.textContent = "I did not catch any words. Try again."; if (ending) break; continue; }
+    add("user", out.user_text);
+    if (ending) break;
+    await hear(out.turn);
+    if ((performance.now() - t0) / 60000 >= minutes) break;
+  }
+  clearInterval(tick); stopMic(); ctx.close();
+  if (over) return;
+  stage.innerHTML = `<p class="muted">Finishing…</p>`;
+  const end = await api(`/api/conversations/${sid}/end`, { method: "POST", body: {} }).catch((e) => ({ status: "error", error: e.message }));
+  if (end.status === "error") { stage.innerHTML = `<p class="err">${esc(end.error || "No speech was captured.")}</p><button class="primary" id="done">Close</button>`; $("#done", stage).addEventListener("click", () => { closeOverlay(); show("today"); }); return; }
+  logEvent("conv_ended", { delays_ms: end.delays_ms }, sid);
+  await showResult(box, sid);
+  if (end.delays_ms && end.delays_ms.length) {
+    const sorted = [...end.delays_ms].sort((a, b) => a - b), med = sorted[Math.floor(sorted.length / 2)];
+    const p = document.createElement("p"); p.className = "small muted";
+    p.textContent = `Time to start answering after your partner finished: median ${(med / 1000).toFixed(1)} s over ${end.delays_ms.length} turns. A shorter delay with the same content is a sign of faster formulation.`;
+    $("#stage", box).prepend(p);
+  }
+}
+
+async function conversationCard() {
+  const cfg = await api("/api/conversations/config").catch(() => null);
+  if (!cfg) return "";
+  const ready = cfg.llm_ready;
+  return `<div class="card"><h3>Talk with a partner</h3><p class="muted small">A spoken conversation. The partner asks, you answer out loud, it waits for you as long as you choose. Your speech is measured like any other session, then you get the same feedback. ${ready ? "" : `<span class="err">Not available: ${esc(cfg.llm_error || "no language model")}</span>`}</p>
+    <div class="row"><select id="conv-scn">${SCENARIOS.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}<option value="">My own scenario…</option></select><select id="conv-len"><option value="5">5 min</option><option value="10" selected>10 min</option><option value="20">20 min</option></select><select id="conv-wait" title="How long the partner waits after you go quiet"><option value="2500">Waits 2.5 s</option><option value="4000" selected>Waits 4 s</option><option value="6000">Waits 6 s</option></select></div>
+    <div class="row" style="margin-top:8px"><input type="text" id="conv-custom" placeholder="Describe the situation" size="50" hidden><button class="primary" id="conv-start" ${ready ? "" : "disabled"}>Start</button></div>
+    <p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
+}
+
+function wireConversationCard() {
+  const sel = $("#conv-scn"); if (!sel) return;
+  sel.addEventListener("change", () => { const c = $("#conv-custom"); c.hidden = sel.value !== ""; if (!c.hidden) c.focus(); });
+  $("#conv-start").addEventListener("click", () => {
+    const scn = sel.value || $("#conv-custom").value.trim();
+    if (!scn) { alert("Describe the situation first."); return; }
+    runConversation(scn, Number($("#conv-len").value), Number($("#conv-wait").value));
+  });
+}
