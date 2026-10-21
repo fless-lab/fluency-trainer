@@ -659,7 +659,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except Exception as exc:  # noqa: BLE001
                 events.write("conv.stt_error", sid, error=str(exc))
                 raise HTTPException(502, f"Transcription failed: {exc}") from exc
-            events.write("conv.stt", sid, seconds=round(time.monotonic() - started, 2), words=len(result.words))
+            stt_s = round(time.monotonic() - started, 2)
+            events.write("conv.stt", sid, seconds=stt_s, words=len(result.words))
             text = (result.text or "").strip()
             if not result.words or not text:
                 return {"empty": True}
@@ -667,9 +668,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         speech_ms=int(duration_s * 1000))
             if db.get_session(sid)["status"] == "created":
                 db.update_session(sid, status="talking")
+            t1 = time.monotonic()
             reply = await partner_reply(sid, s, opening=False)
+            t2 = time.monotonic()
             turn = await partner_say(sid, reply)
-            return {"empty": False, "user_text": text, "turn": turn}
+            t3 = time.monotonic()
+            timing = {"stt_s": stt_s, "llm_s": round(t2 - t1, 2), "voice_s": round(t3 - t2, 2), "total_s": round(t3 - started, 2)}
+            events.write("conv.turn_timing", sid, **timing)
+            return {"empty": False, "user_text": text, "turn": turn, "timing": timing}
 
     @app.post("/api/conversations/{sid}/end")
     def conv_end(sid: str) -> dict[str, Any]:
