@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import sys
 import time
 import traceback
 import uuid
@@ -29,7 +30,9 @@ from .tts.openai_compat import OpenAICompatTTS
 from .notebook import find_use, KINDS, RESULTS, build_suggest_messages, clean, context_around, now_iso, parse_suggestions, schedule_after
 from .lesson import LESSON_VERSION, build_messages as lesson_messages, parse_lesson
 from .coach import COACH_VERSION, MIN_WORDS, annotate_transcript, build_messages, parse_feedback
-from .config import Settings, load_settings
+from . import config
+from .config import ROOT, Settings, load_settings
+from . import settings_admin as sadm
 from .db import DB
 from .eventlog import EventLog, utcnow
 from .metrics import METRICS_VERSION, compute_metrics
@@ -104,6 +107,11 @@ class NotebookIn(BaseModel):
     english: str | None = Field(default=None, max_length=300)
     session_id: str | None = Field(default=None, max_length=64)
     source: Literal["manual", "coach", "prep", "pronunciation"] = "manual"
+
+
+class SettingsIn(BaseModel):
+    values: dict[str, Any] = Field(default_factory=dict)
+    clear: list[str] = Field(default_factory=list)
 
 
 class TargetsIn(BaseModel):
@@ -595,6 +603,102 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not seg:
             raise HTTPException(404, "nothing at that time")
         return Response(pron.to_wav(seg), media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+
+    # settings screen -------------------------------------------------------------------------------
+    env_path = ROOT / ".env"
+    LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+    def local_only(request: Request) -> None:
+        """The settings hold keys and can restart the app: only the machine it runs on may use them."""
+        if (request.client.host if request.client else "") not in LOCAL_HOSTS:
+            raise HTTPException(403, "The settings can only be changed from the computer the app runs on.")
+
+    @app.get("/api/settings")
+    def get_settings(request: Request) -> dict[str, Any]:
+        local_only(request)
+        running = {k: os.environ.get(k, "") for k in sadm.BY_KEY}
+        return {"groups": sadm.describe(sadm.read_env(env_path), running), "env_file": str(env_path), "env_exists": env_path.is_file()}
+
+    @app.post("/api/settings")
+    def save_settings(body: SettingsIn, request: Request) -> dict[str, Any]:
+        local_only(request)
+        try:
+            updates = sadm.clean_updates(body.values, body.clear)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        before = sadm.read_env(env_path)
+        updates = {k: v for k, v in updates.items() if before.get(k, "") != v}
+        if updates:
+            sadm.write_env(env_path, updates)
+        events.write("settings.saved", None, keys=sorted(updates))  # the names only, never the values
+        return {"changed": sorted(updates), "restart_needed": bool(updates)}
+
+    @app.post("/api/restart")
+    async def restart(request: Request) -> dict[str, Any]:
+        local_only(request)
+        events.write("app.restart_requested", None)
+
+        def again() -> None:
+            for key in config.LOADED_FROM_FILE:  # values that came from .env are read again by the new process
+                os.environ.pop(key, None)
+            os.chdir(ROOT)
+            os.execv(sys.executable, sys.orig_argv)  # the same command that started this run
+        asyncio.get_running_loop().call_later(0.7, again)
+        return {"restarting": True}
+
+    @app.post("/api/settings/test/{service}")
+    async def test_service(service: str, request: Request) -> dict[str, Any]:
+        """Check a saved (not yet applied) setting by really using it once, so a wrong key shows up now."""
+        local_only(request)
+        cfg = load_settings({**os.environ, **sadm.read_env(env_path)})
+        started = time.monotonic()
+        try:
+            msg = await check_service(service, cfg)
+            return {"ok": True, "message": msg, "ms": round((time.monotonic() - started) * 1000)}
+        except Exception as exc:  # noqa: BLE001 - whatever goes wrong is shown to the person
+            return {"ok": False, "message": str(exc)[:400], "ms": round((time.monotonic() - started) * 1000)}
+
+    async def check_service(service: str, cfg: Settings) -> str:
+        if service == "stt":
+            if cfg.stt_provider == "mock":
+                return "Mock provider: nothing to check."
+            if not cfg.assemblyai_key:
+                raise RuntimeError("No AssemblyAI key saved.")
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get("https://streaming.assemblyai.com/v3/token", params={"expires_in_seconds": 60},
+                                     headers={"Authorization": cfg.assemblyai_key})
+            if r.status_code >= 400:
+                raise RuntimeError(f"AssemblyAI refused the key (HTTP {r.status_code}).")
+            return "AssemblyAI accepted the key."
+        if service in ("llm", "chat"):
+            c = cfg if service == "llm" else dataclasses.replace(cfg, llm_model=cfg.llm_chat_model or cfg.llm_model)
+            model, err = make_llm(c)
+            if model is None:
+                raise RuntimeError(err or "No language model configured.")
+            r = await model.complete("Reply with the single word: ok", "Say it.", 20)
+            return f"{model.model} answered: {r.text.strip()[:40]}"
+        if service == "voice":
+            tts_, err = make_tts(cfg)
+            if tts_ is None:
+                raise RuntimeError(err or "No voice configured (the browser's own voice is used).")
+            r = await tts_.speak("Hello")
+            return f"{tts_.model} made {len(r.audio) // 1024} KB of audio."
+        if service == "azure":
+            if not (cfg.azure_speech_key and cfg.azure_speech_region):
+                raise RuntimeError("Both the Azure key and the region are needed.")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                await pron.assess_wav(client, pron.to_wav(b"\x00\x00" * 16000), cfg.azure_speech_key, cfg.azure_speech_region, cfg.pron_locale)
+            return f"Azure accepted the key in {cfg.azure_speech_region}."
+        if service == "audio":
+            if not (cfg.audio_key and cfg.audio_model):
+                raise RuntimeError("No audio model or key (the voice or language model key is reused only with openrouter).")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post("https://openrouter.ai/api/v1/chat/completions", headers={"Authorization": f"Bearer {cfg.audio_key}"},
+                                      json={"model": cfg.audio_model, "max_tokens": 10, "messages": [{"role": "user", "content": "Say ok"}]})
+            if r.status_code >= 400:
+                raise RuntimeError(f"{cfg.audio_model}: HTTP {r.status_code}: {r.text[:200]}")
+            return f"{cfg.audio_model} answered."
+        raise HTTPException(404, "unknown service")
 
     @app.get("/api/pronunciation/progress")
     def pronunciation_progress() -> dict[str, Any]:

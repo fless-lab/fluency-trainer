@@ -3,8 +3,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 ROOT = Path(__file__).resolve().parent.parent
+# Names taken from the .env file (not from the real environment). A restart must forget them, or the new process would
+# inherit the old values through the environment and never read the changed file.
+LOADED_FROM_FILE: set[str] = set()
 
 
 def _load_env_file(path: Path) -> None:
@@ -16,7 +20,10 @@ def _load_env_file(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        key = key.strip()
+        if key not in os.environ:
+            LOADED_FROM_FILE.add(key)
+        os.environ.setdefault(key, value.strip().strip('"').strip("'"))
 
 
 @dataclass(frozen=True)
@@ -50,43 +57,47 @@ class Settings:
     native_language: str = "French"
 
 
-def load_settings() -> Settings:
-    _load_env_file(ROOT / ".env")
-    data_dir = Path(os.environ.get("DATA_DIR", "./data"))
+def load_settings(env: Mapping[str, str] | None = None) -> Settings:
+    """Settings from the environment (after reading .env), or from the given mapping, which is how a saved but not yet applied
+    configuration is checked."""
+    if env is None:
+        _load_env_file(ROOT / ".env")
+        env = os.environ
+    data_dir = Path(env.get("DATA_DIR", "./data"))
     if not data_dir.is_absolute():
         data_dir = (ROOT / data_dir).resolve()
     models = tuple(
-        m.strip() for m in os.environ.get("ASSEMBLYAI_SPEECH_MODELS", "").split(",") if m.strip()
+        m.strip() for m in env.get("ASSEMBLYAI_SPEECH_MODELS", "").split(",") if m.strip()
     )
     return Settings(
         data_dir=data_dir,
-        stt_provider=os.environ.get("STT_PROVIDER", "assemblyai").strip().lower(),
-        assemblyai_key=os.environ.get("ASSEMBLYAI_API_KEY", "").strip(),
+        stt_provider=env.get("STT_PROVIDER", "assemblyai").strip().lower(),
+        assemblyai_key=env.get("ASSEMBLYAI_API_KEY", "").strip(),
         assemblyai_models=models,
-        max_upload_bytes=int(os.environ.get("MAX_UPLOAD_MB", "100")) * 1024 * 1024,
-        host=os.environ.get("HOST", "127.0.0.1"),
-        port=int(os.environ.get("PORT", "8765")),
-        llm_provider=os.environ.get("LLM_PROVIDER", "none").strip().lower(),
-        llm_key=os.environ.get("LLM_API_KEY", "").strip(),
-        llm_model=os.environ.get("LLM_MODEL", "").strip(),
-        llm_base_url=os.environ.get("LLM_BASE_URL", "").strip(),
-        coach_max_per_day=int(os.environ.get("COACH_MAX_PER_DAY", "30")),
-        llm_chat_model=os.environ.get("LLM_CHAT_MODEL", "").strip(),
-        tts_provider=os.environ.get("TTS_PROVIDER", "none").strip().lower(),
-        tts_key=os.environ.get("TTS_API_KEY", "").strip() or (
-            os.environ.get("LLM_API_KEY", "").strip() if os.environ.get("TTS_PROVIDER", "").strip().lower() == "openrouter" else ""),
-        tts_model=os.environ.get("TTS_MODEL", "").strip(),
-        tts_voice=os.environ.get("TTS_VOICE", "alloy").strip(),
-        tts_base_url=os.environ.get("TTS_BASE_URL", "").strip(),
-        chat_max_per_day=int(os.environ.get("CHAT_MAX_PER_DAY", "400")),
-        tts_max_chars_per_day=int(os.environ.get("TTS_MAX_CHARS_PER_DAY", "60000")),
-        azure_speech_key=os.environ.get("AZURE_SPEECH_KEY", "").strip(),
-        azure_speech_region=os.environ.get("AZURE_SPEECH_REGION", "").strip().lower(),
-        pron_locale=os.environ.get("PRONUNCIATION_LOCALE", "en-US").strip(),
-        pron_concurrency=int(os.environ.get("PRONUNCIATION_CONCURRENCY", "1")),
-        native_language=os.environ.get("NATIVE_LANGUAGE", "French").strip() or "French",
-        audio_model=os.environ.get("AUDIO_COACH_MODEL", "google/gemini-3.1-flash-lite").strip(),
-        audio_key=os.environ.get("AUDIO_COACH_KEY", "").strip() or (
-            os.environ.get("TTS_API_KEY", "").strip() or os.environ.get("LLM_API_KEY", "").strip()
-            if "openrouter" in (os.environ.get("TTS_PROVIDER", "") + os.environ.get("LLM_PROVIDER", "")).lower() else ""),
+        max_upload_bytes=int(env.get("MAX_UPLOAD_MB", "100")) * 1024 * 1024,
+        host=env.get("HOST", "127.0.0.1"),
+        port=int(env.get("PORT", "8765")),
+        llm_provider=env.get("LLM_PROVIDER", "none").strip().lower(),
+        llm_key=env.get("LLM_API_KEY", "").strip(),
+        llm_model=env.get("LLM_MODEL", "").strip(),
+        llm_base_url=env.get("LLM_BASE_URL", "").strip(),
+        coach_max_per_day=int(env.get("COACH_MAX_PER_DAY", "30")),
+        llm_chat_model=env.get("LLM_CHAT_MODEL", "").strip(),
+        tts_provider=env.get("TTS_PROVIDER", "none").strip().lower(),
+        tts_key=env.get("TTS_API_KEY", "").strip() or (
+            env.get("LLM_API_KEY", "").strip() if env.get("TTS_PROVIDER", "").strip().lower() == "openrouter" else ""),
+        tts_model=env.get("TTS_MODEL", "").strip(),
+        tts_voice=env.get("TTS_VOICE", "alloy").strip(),
+        tts_base_url=env.get("TTS_BASE_URL", "").strip(),
+        chat_max_per_day=int(env.get("CHAT_MAX_PER_DAY", "400")),
+        tts_max_chars_per_day=int(env.get("TTS_MAX_CHARS_PER_DAY", "60000")),
+        azure_speech_key=env.get("AZURE_SPEECH_KEY", "").strip(),
+        azure_speech_region=env.get("AZURE_SPEECH_REGION", "").strip().lower(),
+        pron_locale=env.get("PRONUNCIATION_LOCALE", "en-US").strip(),
+        pron_concurrency=int(env.get("PRONUNCIATION_CONCURRENCY", "1")),
+        native_language=env.get("NATIVE_LANGUAGE", "French").strip() or "French",
+        audio_model=env.get("AUDIO_COACH_MODEL", "google/gemini-3.1-flash-lite").strip(),
+        audio_key=env.get("AUDIO_COACH_KEY", "").strip() or (
+            env.get("TTS_API_KEY", "").strip() or env.get("LLM_API_KEY", "").strip()
+            if "openrouter" in (env.get("TTS_PROVIDER", "") + env.get("LLM_PROVIDER", "")).lower() else ""),
     )

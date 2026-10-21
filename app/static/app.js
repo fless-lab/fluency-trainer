@@ -198,7 +198,7 @@ async function refreshState() {
   else banner.hidden = true;
 }
 
-const TABS = { today: renderToday, notebook: renderNotebook, history: renderHistory, progress: renderProgress, data: renderData };
+const TABS = { today: renderToday, notebook: renderNotebook, history: renderHistory, progress: renderProgress, data: renderData, settings: renderSettings };
 let currentTab = "today";
 async function show(tab) {
   currentTab = tab;
@@ -964,6 +964,64 @@ async function pronunciationProgressHtml() {
     ${sounds ? `<div class="card scroll"><table><thead><tr><th>Sound</th><th>Average</th><th>Over time</th><th>Change</th><th>Sessions</th></tr></thead><tbody>${sounds}</tbody></table></div>` : ""}
     ${recurring ? `<h4 style="margin:14px 0 4px">Words that keep coming back</h4><p style="margin:0">${recurring}</p>` : ""}
     <p class="small muted">A guide, not a verdict: a score also depends on the recording, the topic and how fast you spoke, so small changes mean little.</p>`;
+}
+
+// ---------------------------------------------------------------- settings
+const SETTINGS_CHECKS = { stt: [["stt", "Check the key"]], llm: [["llm", "Check feedback model"], ["chat", "Check conversation model"]], voice: [["voice", "Check the voice"]], pron: [["azure", "Check Azure"], ["audio", "Check audio model"]] };
+
+async function renderSettings() {
+  let r;
+  try { r = await api("/api/settings"); }
+  catch (e) { view.innerHTML = `<h2>Settings</h2><p class="err">${esc(e.message)}</p>`; return; }
+  const input = (f) => {
+    const id = `st-${f.key}`;
+    const pending = f.pending && (f.kind !== "secret") ? ` <span class="chip mid" title="Saved in .env but not running yet: restart the app">restart to apply</span>` : "";
+    let control;
+    if (f.kind === "secret") control = `<input type="password" id="${id}" data-key="${f.key}" autocomplete="off" placeholder="${f.set ? `Saved (${esc(f.hint)}) · type to replace` : "Paste a key"}" size="44"> ${f.set ? `<label class="small"><input type="checkbox" data-clear="${f.key}"> remove</label>` : ""}`;
+    else if (f.kind === "select") control = `<select id="${id}" data-key="${f.key}">${f.options.map((o) => `<option value="${esc(o)}" ${o === f.value ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+    else if (f.kind === "number") control = `<input type="number" id="${id}" data-key="${f.key}" value="${esc(f.value)}" placeholder="${esc(f.placeholder)}" min="${f.low ?? ""}" max="${f.high ?? ""}" style="width:110px">`;
+    else control = `<input type="text" id="${id}" data-key="${f.key}" value="${esc(f.value)}" placeholder="${esc(f.placeholder)}" size="44" autocomplete="off">`;
+    return `<div style="margin:10px 0"><label for="${id}"><strong>${esc(f.label)}</strong></label>${pending}<br>${control}${f.help ? `<div class="small muted">${esc(f.help)}</div>` : ""}</div>`;
+  };
+  const groups = r.groups.map((g) => `<div class="card"><h3>${esc(g.title)}</h3><p class="muted small" style="margin-top:0">${esc(g.blurb)}</p>${g.fields.map(input).join("")}
+    ${(SETTINGS_CHECKS[g.id] || []).length ? `<div class="row">${SETTINGS_CHECKS[g.id].map(([svc, label]) => `<button class="secondary" data-check="${svc}">${label}</button>`).join("")}</div>${SETTINGS_CHECKS[g.id].map(([svc]) => `<div class="small" data-res="${svc}" style="margin-top:6px"></div>`).join("")}` : ""}</div>`).join("");
+  view.innerHTML = `<h2>Settings</h2><p class="lead">Everything the app needs to work, in one place. It is saved in the <code>.env</code> file next to the app (${esc(r.env_file)}): keys stay on this computer and are never shown again here, only their last four characters. A change applies after a restart.</p>
+    <div id="st-banner"></div>${groups}
+    <div class="row" style="margin:14px 0"><button class="primary" id="st-save">Save</button><span class="small muted" id="st-msg"></span></div>`;
+
+  const collect = () => {
+    const values = {}, clear = [];
+    view.querySelectorAll("[data-key]").forEach((el) => { values[el.dataset.key] = el.value; });
+    view.querySelectorAll("[data-clear]:checked").forEach((el) => clear.push(el.dataset.clear));
+    return { values, clear };
+  };
+  const banner = (changed) => {
+    $("#st-banner").innerHTML = `<div class="card due"><div class="tag">Saved</div><p style="margin:4px 0">Changed: ${changed.map(esc).join(", ")}. The app must restart to use it.</p><button class="primary" id="st-restart">Restart the app now</button> <span class="small muted" id="st-restart-msg"></span></div>`;
+    $("#st-restart").addEventListener("click", async () => {
+      $("#st-restart").disabled = true; $("#st-restart-msg").textContent = "Restarting…";
+      try { await api("/api/restart", { method: "POST" }); } catch (_) {}
+      for (let i = 0; i < 60; i++) { await sleep(700); try { await fetch("/api/state"); if (i > 1) { location.reload(); return; } } catch (_) {} }
+      $("#st-restart-msg").textContent = "It is taking long. Start it again from the terminal: python -m app";
+    });
+  };
+  $("#st-save").addEventListener("click", async () => {
+    $("#st-msg").textContent = "Saving…";
+    try {
+      const out = await api("/api/settings", { method: "POST", body: collect() });
+      $("#st-msg").textContent = out.changed.length ? "Saved." : "Nothing changed.";
+      if (out.changed.length) banner(out.changed);
+      logEvent("settings_saved", { count: out.changed.length });
+    } catch (e) { $("#st-msg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+  });
+  view.querySelectorAll("[data-check]").forEach((b) => b.addEventListener("click", async () => {
+    const out = $(`[data-res="${b.dataset.check}"]`, b.closest(".card"));
+    out.textContent = "Checking…"; b.disabled = true;
+    try {
+      const res = await api(`/api/settings/test/${b.dataset.check}`, { method: "POST" });
+      out.innerHTML = `<span class="${res.ok ? "" : "err"}">${res.ok ? "✓" : "✗"} ${esc(b.textContent.replace(/^Check /, ""))}: ${esc(res.message)}</span> <span class="muted">(${res.ms} ms)</span>`;
+    } catch (e) { out.innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+    b.disabled = false;
+  }));
 }
 
 // ---------------------------------------------------------------- data
