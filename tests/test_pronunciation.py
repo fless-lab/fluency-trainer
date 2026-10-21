@@ -73,3 +73,61 @@ def test_the_audio_model_answer_is_checked_and_trimmed(monkeypatch):
     out = asyncio.run(pr.listen(clips, {"s": _pcm(2)}, "k", "m"))
     assert out["clips"] == [{"word": "think", "heard": "sink", "issue": "th is s", "fix": "tongue between teeth"}] and out["overall"] == "flat"
     assert "sounds like sink" in pr.ear_for_coach(out)
+
+
+def _settings(tmp_path, ear=False):
+    from app.config import Settings
+    return Settings(data_dir=tmp_path / "data", stt_provider="mock", assemblyai_key="", assemblyai_models=(),
+                    max_upload_bytes=1024 * 1024, host="127.0.0.1", port=0, azure_speech_key="k", azure_speech_region="norwayeast",
+                    audio_key="k" if ear else "")
+
+
+def _wait(c, sid, want, tries=60):
+    import time
+    for _ in range(tries):
+        r = c.get(f"/api/sessions/{sid}/pronunciation").json()
+        if r["state"] == want and not r["ear_pending"]:
+            return r
+        time.sleep(0.05)
+    return r
+
+
+def test_score_button_starts_scoring_in_the_background_and_the_result_is_stored(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from tests.test_api import record
+    calls = []
+
+    async def fake_assess(path, key, region, locale, gate=None):
+        calls.append(path)
+        chunk = pr.summarize_chunk(_azure([("think", 40, [("th", 20), ("ih", 90)])]), 0.0)
+        return {"seconds": 3.0, "chunks": [{**chunk, "seconds": 3.0}]}
+
+    async def fake_listen(clips, pcm, key, model, base="x"):
+        return {"model": model, "clips": [{"word": "think", "heard": "sink", "issue": "th", "fix": "tongue"}], "overall": "ok"}
+    monkeypatch.setattr(pr, "assess_audio", fake_assess)
+    monkeypatch.setattr(pr, "decode_pcm16k", lambda path: _pcm(4))
+    monkeypatch.setattr(pr, "listen", fake_listen)
+    with TestClient(create_app(_settings(tmp_path, ear=True))) as c:
+        sid = record(c)                                  # scored right after the upload
+        first = _wait(c, sid, "done")
+        assert first["state"] == "done" and first["summary"]["worst_words"][0]["word"] == "think"
+        assert first["ear"]["clips"][0]["heard"] == "sink"
+        n = len(calls)
+        r = c.post(f"/api/sessions/{sid}/pronunciation")  # the button: this used to fail with "no running event loop"
+        assert r.status_code == 202 and r.json()["state"] == "pending"
+        again = _wait(c, sid, "done")
+        assert again["state"] == "done" and len(calls) == n + 1 and again["ear"] is not None
+
+
+def test_score_button_says_so_when_azure_is_not_configured(tmp_path):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from app.config import Settings
+    from tests.test_api import record
+    s = Settings(data_dir=tmp_path / "data", stt_provider="mock", assemblyai_key="", assemblyai_models=(),
+                 max_upload_bytes=1024 * 1024, host="127.0.0.1", port=0)
+    with TestClient(create_app(s)) as c:
+        sid = record(c)
+        assert c.get(f"/api/sessions/{sid}/pronunciation").json()["state"] == "off"
+        assert c.post(f"/api/sessions/{sid}/pronunciation").status_code == 503

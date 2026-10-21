@@ -574,7 +574,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "ear": ear, "ear_pending": bool(ear_on and not ear and sid in ear_tasks and not ear_tasks[sid].done())}
 
     @app.post("/api/sessions/{sid}/pronunciation", status_code=202)
-    def run_pronunciation(sid: str) -> dict[str, Any]:
+    async def run_pronunciation(sid: str) -> dict[str, Any]:  # async: it starts background tasks, which need the event loop
         s = need_session(sid)
         if not pron_on:
             raise HTTPException(503, "Pronunciation scoring needs AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in .env.")
