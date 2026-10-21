@@ -947,7 +947,7 @@ class LiveSTT {
     this.close(); this.turns = {}; this.completeAt = null; this.carry = []; this.buffered = []; this.ready = false; this.terminated = null;
     try {
       const t = await api("/api/conversations/stream-token");
-      const ws = new WebSocket(`${t.url}?sample_rate=16000&token=${encodeURIComponent(t.token)}&end_of_turn_confidence_threshold=0.6&min_end_of_turn_silence_when_confident=300&max_turn_silence=3000`);
+      const ws = new WebSocket(`${t.url}?sample_rate=16000&token=${encodeURIComponent(t.token)}&end_of_turn_confidence_threshold=0.7&min_end_of_turn_silence_when_confident=500&max_turn_silence=3000`);
       this.ws = ws;
       ws.onmessage = (e) => {
         let m; try { m = JSON.parse(e.data); } catch (_) { return; }
@@ -1052,7 +1052,7 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   const setPhase = (phase, text) => { pill.dataset.phase = phase; stateEl.textContent = text; };
   // who decides that you have finished: you (button) or the app (a pause), switchable at any time
   let auto = patienceMs > 0; const basePatience = patienceMs || 4000;
-  const quietAfterComplete = Math.round(basePatience * 0.14);  // 6 s patient: 0.8 s, 4 s normal: 0.6 s, 2.5 s quick: 0.35 s
+  const quietAfterComplete = Math.round(basePatience * 0.3);  // patient 1.8 s, natural 1.2 s, quick 0.75 s of real silence after a finished sentence
   const drawMode = () => { $("#m-manual", stage).classList.toggle("on", !auto); $("#m-auto", stage).classList.toggle("on", auto); };
   $("#m-manual", stage).addEventListener("click", () => { auto = false; drawMode(); });
   $("#m-auto", stage).addEventListener("click", () => { auto = true; drawMode(); });
@@ -1126,20 +1126,24 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
     const chunks = []; rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
     rec.start(500);
     const turnStart = performance.now();
-    let spoke = false, firstSpeechAt = null, lastVoiceAt = performance.now(), voiceMs = 0;
+    let spoke = false, firstSpeechAt = null, lastVoiceAt = performance.now(), voiceMs = 0, endReason = "button";
     while (!over && !doneNow) {
       await sleep(80);
       const now = performance.now();
-      if (isVoice()) { voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 160) { spoke = true; firstSpeechAt = now - 160; setPhase("you", auto ? "Listening… I answer when you pause." : "Listening… press “I'm done” when you finish."); } }
+      // the first 0.35 s after the partner stops are ignored: its own voice can still come back through the microphone
+      const echoGrace = !bargedIn && now - turnStart < 350;
+      if (!echoGrace && isVoice()) { voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 240) { spoke = true; firstSpeechAt = now - 240; setPhase("you", auto ? "Listening… I answer when you pause." : "Listening… press “I'm done” when you finish."); } }
       if (auto && spoke) {
         // like a voice assistant: answer soon after a finished sentence, wait longer when you are still searching for words
         const heard = liveOk ? live.heard() : "", quiet = now - lastVoiceAt;
-        if (liveOk && live.completeAt && quiet > quietAfterComplete && !UNFINISHED.test(heard)) break;
-        if (quiet > patienceFor(heard)) break;
+        if (liveOk && !heard) { /* the detector heard something but no word was recognised: noise or echo, keep waiting */ }
+        else if (liveOk && live.completeAt && quiet > quietAfterComplete && !UNFINISHED.test(heard)) { endReason = "sentence_complete"; break; }
+        else if (quiet > patienceFor(heard)) { endReason = "patience"; break; }
       }
-      if (now - turnStart > 150000) break;
+      if (now - turnStart > 150000) { endReason = "cap"; break; }
     }
     const durationS = (performance.now() - turnStart) / 1000;
+    logEvent("conv_turn_end", { reason: doneNow ? "button" : endReason, auto, spoke, voice_ms: voiceMs, seconds: Math.round(durationS * 10) / 10, heard_words: liveOk ? live.heard().split(/\s+/).filter(Boolean).length : null, neural_vad: vadOk }, sid);
     await new Promise((resolve) => { rec.onstop = resolve; if (rec.state !== "inactive") rec.stop(); });
     if (over) break;
     if (!spoke) { if (ending) break; continue; }  // nothing said: keep waiting, nothing is sent
