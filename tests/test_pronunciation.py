@@ -131,3 +131,28 @@ def test_score_button_says_so_when_azure_is_not_configured(tmp_path):
         sid = record(c)
         assert c.get(f"/api/sessions/{sid}/pronunciation").json()["state"] == "off"
         assert c.post(f"/api/sessions/{sid}/pronunciation").status_code == 503
+
+
+def test_small_words_and_half_words_are_left_out_of_the_lists_but_not_the_scores():
+    d = pr.summarize_chunk(_azure([("ifying", 29, [("f", 25)]), ("didn't", 5, [("d", 0)]), ("mathematical", 45, [("th", 38), ("l", 27)]),
+                                    ("cat", 95, [("k", 95)]), ("so", 34, [("s", 35)]), ("bank", 39, [("b", 26)]), ("vision", 20, [("zh", 18)])]),
+                           10.0, cut_start=True, cut_end=True)
+    assert d["words"][0]["edge"] is True and d["words"][-1]["edge"] is True and d["words"][2]["edge"] is False
+    agg = pr.aggregate([{"seconds": 9.0, "unit": "s", "chunks": [d]}])
+    assert [w["word"] for w in agg["worst_words"]] == ["bank", "mathematical"]  # lowest first; no ifying (cut), didn't, so (small), vision (cut)
+    assert agg["n_words"] == 7 and agg["scores"]["AccuracyScore"] == 90  # the scores still count every word
+
+
+def test_a_word_is_cut_out_of_the_persons_own_recording(tmp_path, monkeypatch):
+    import io, wave
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from tests.test_api import record
+    monkeypatch.setattr(pr, "decode_pcm16k", lambda path: _pcm(5))
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        sid = record(c)
+        r = c.get(f"/api/sessions/{sid}/clip", params={"unit": "s", "t": 1.0, "d": 0.5})
+        w = wave.open(io.BytesIO(r.content))
+        assert r.status_code == 200 and abs(w.getnframes() / w.getframerate() - 1.0) < 0.01  # 0.2 s before, the word, 0.3 s after
+        assert c.get(f"/api/sessions/{sid}/clip", params={"unit": "7", "t": 1.0}).status_code == 404
+        assert c.get(f"/api/sessions/{sid}/clip", params={"unit": "s", "t": 99.0}).status_code == 404

@@ -252,3 +252,6 @@ body.calm .confetti { display: none; }
 .say-partner[data-say]:hover { filter: brightness(.96); }
 @keyframes sayPulse { 50% { background: var(--yellow); color: #1d1b38; } }
 @media (prefers-reduced-motion: reduce) { .say.saying { animation: none; background: var(--yellow); color: #1d1b38; } }
+.hear { margin-left: 6px; white-space: nowrap; }
+button.mini { padding: 0 9px; font-size: 12px; line-height: 20px; margin-right: 4px; box-shadow: 2px 2px 0 var(--ink); }
+button.mini.saying { background: var(--yellow); color: #1d1b38; }

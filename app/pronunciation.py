@@ -110,16 +110,29 @@ async def assess_wav(client: httpx.AsyncClient, wav: bytes, key: str, region: st
     raise PronunciationError(f"Azure: {last}")
 
 
-def summarize_chunk(d: dict[str, Any], offset_s: float) -> dict[str, Any]:
-    """Keep what is useful from one Azure answer: the scores and, for every word, its sounds."""
+# Small words are said in a weak form in fast English ("didn't" becomes "din", "for" becomes "fer"): a low score on
+# them is normal speech, not a mistake to practise, so they are left out of the lists of words and sounds to work on.
+FUNCTION_WORDS = set("""a an the and or but so if as at by for from in into of off on onto out over to up with without about
+after again all also am any are aren't be been being both can can't could couldn't did didn't do does doesn't don't each
+else even ever few for get got had has hasn't have haven't he her here hers him his how i i'd i'll i'm i've is isn't it
+it's its just like me more most my no nor not now one only other our ours she should shouldn't some such than that that's
+the their them then there there's these they they're this those too us very was wasn't we we're were weren't what when
+where which who whom whose why will won't would wouldn't yeah yes you you're your yours um uh oh""".split())
+
+
+def summarize_chunk(d: dict[str, Any], offset_s: float, cut_start: bool = False, cut_end: bool = False) -> dict[str, Any]:
+    """Keep what is useful from one Azure answer: the scores and, for every word, its sounds.
+    The first word of a window that was cut out of longer audio, and the last one, may be half a word: they are marked."""
     if d.get("RecognitionStatus") != "Success":
         return {"words": [], "scores": {}}
     nb = (d.get("NBest") or [{}])[0]
     words = []
-    for w in nb.get("Words") or []:
+    raw = nb.get("Words") or []
+    for i, w in enumerate(raw):
         phonemes = [{"p": p.get("Phoneme"), "s": p.get("AccuracyScore")} for p in w.get("Phonemes") or []]
         words.append({"w": w.get("Word"), "acc": w.get("AccuracyScore"), "err": w.get("ErrorType") or "None",
-                      "t": round(offset_s + (w.get("Offset") or 0) / 1e7, 2), "ph": phonemes})
+                      "t": round(offset_s + (w.get("Offset") or 0) / 1e7, 2), "d": round((w.get("Duration") or 0) / 1e7, 2),
+                      "ph": phonemes, "edge": (i == 0 and cut_start) or (i == len(raw) - 1 and cut_end)})
     scores = {k: nb.get(k) for k in ("AccuracyScore", "FluencyScore", "ProsodyScore", "PronScore")}
     return {"words": words, "scores": scores}
 
@@ -138,7 +151,7 @@ async def assess_audio(path: str, key: str, region: str, locale: str,
         wav = to_wav(pcm[int(a * RATE) * 2: int(b * RATE) * 2])
         async with gate:
             d = await assess_wav(client, wav, key, region, locale)
-        out = summarize_chunk(d, a)
+        out = summarize_chunk(d, a, cut_start=a > 0.01, cut_end=b < total - 0.01)
         out["seconds"] = round(b - a, 2)
         return out
 
@@ -166,6 +179,9 @@ def aggregate(units: list[dict[str, Any]]) -> dict[str, Any]:
                     scores.setdefault(k, []).append((float(v), float(n)))
             for w in c["words"]:
                 all_words.append({**w, "unit": u.get("unit")})
+    for w in all_words:
+        w["skip"] = bool(w.get("edge")) or (w["w"] or "").lower() in FUNCTION_WORDS or len(w["w"] or "") < 3
+    all_words_all, all_words = all_words, [w for w in all_words if not w["skip"]]  # scores keep every word, the lists do not
     weak_words = [w for w in all_words if isinstance(w["acc"], (int, float)) and (w["acc"] < WORD_WEAK_BELOW or w["err"] != "None")]
     weak_words.sort(key=lambda w: w["acc"])
     seen: set[str] = set()
@@ -178,7 +194,7 @@ def aggregate(units: list[dict[str, Any]]) -> dict[str, Any]:
         times = sum(1 for x in weak_words if (x["w"] or "").lower() == key)
         bad = [p for p in w["ph"] if isinstance(p["s"], (int, float)) and p["s"] < PHONEME_WEAK_BELOW]
         worst.append({"word": w["w"], "score": w["acc"], "times": times, "error": w["err"], "weak_sounds": bad,
-                      "sounds": w["ph"], "t": w["t"], "unit": w["unit"]})
+                      "sounds": w["ph"], "t": w["t"], "d": w.get("d") or 1.0, "unit": w["unit"]})
         if len(worst) >= 12:
             break
     per_ph: dict[str, list[float]] = {}
@@ -196,7 +212,7 @@ def aggregate(units: list[dict[str, Any]]) -> dict[str, Any]:
             weak_sounds.append({"sound": p, "mean": round(mean, 1), "count": len(vals),
                                 "weak_count": sum(1 for v in vals if v < PHONEME_WEAK_BELOW), "words": examples.get(p, [])})
     weak_sounds.sort(key=lambda s: s["mean"])
-    return {"version": PRON_VERSION, "seconds": round(seconds, 1), "n_words": len(all_words),
+    return {"version": PRON_VERSION, "seconds": round(seconds, 1), "n_words": len(all_words_all),
             "scores": {k: _wavg(v) for k, v in scores.items()}, "worst_words": worst, "weak_sounds": weak_sounds[:6]}
 
 

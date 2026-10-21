@@ -574,6 +574,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"state": state, "summary": pron.aggregate(units) if units else None, "error": pron_errors.get(sid),
                 "ear": ear, "ear_pending": bool(ear_on and not ear and sid in ear_tasks and not ear_tasks[sid].done())}
 
+    pcm_cache: dict[str, bytes] = {}
+
+    @app.get("/api/sessions/{sid}/clip")
+    async def audio_clip(sid: str, unit: str, t: float, d: float = 1.0) -> Response:
+        """A word cut out of the person's own recording (unit "s" is a solo session, a number is a conversation turn)."""
+        path = dict(pron_sources(need_session(sid))).get(unit)
+        if not path:
+            raise HTTPException(404, "no audio for this part")
+        if path not in pcm_cache:
+            if len(pcm_cache) >= 3:
+                pcm_cache.pop(next(iter(pcm_cache)))
+            try:
+                pcm_cache[path] = await asyncio.to_thread(pron.decode_pcm16k, path)
+            except pron.PronunciationError as exc:
+                raise HTTPException(500, str(exc)) from exc
+        start, end = max(0.0, t - 0.2), t + min(max(d, 0.3), 6.0) + 0.3
+        seg = pcm_cache[path][int(start * pron.RATE) * 2: int(end * pron.RATE) * 2]
+        if not seg:
+            raise HTTPException(404, "nothing at that time")
+        return Response(pron.to_wav(seg), media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+
     @app.post("/api/sessions/{sid}/pronunciation", status_code=202)
     async def run_pronunciation(sid: str) -> dict[str, Any]:  # async: it starts background tasks, which need the event loop
         s = need_session(sid)

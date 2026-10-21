@@ -44,6 +44,17 @@ document.addEventListener("click", (e) => {
   e.preventDefault();  // inside a label this must not tick the box next to it
   sayText(el.dataset.say, el);
 });
+// play a piece of your own recording
+let clipAudio = null;
+document.addEventListener("click", (e) => {
+  const el = e.target.closest && e.target.closest("[data-clip]");
+  if (!el) return;
+  e.preventDefault(); stopSay();
+  if (clipAudio) { clipAudio.pause(); clipAudio = null; }
+  const a = new Audio(el.dataset.clip); clipAudio = a; el.classList.add("saying");
+  const done = () => { el.classList.remove("saying"); if (clipAudio === a) clipAudio = null; };
+  a.onended = a.onerror = done; a.play().catch(done);
+});
 document.addEventListener("keydown", (e) => {
   if ((e.key === "Enter" || e.key === " ") && e.target.matches && e.target.matches("[data-say]")) { e.preventDefault(); sayText(e.target.dataset.say, e.target); }
 });
@@ -703,10 +714,10 @@ function renderPron(box, r, detail) {
   const tiles = SCORE_LABELS.filter(([k]) => sm.scores[k] != null).map(([k, label]) => `<div class="chip ${scoreClass(sm.scores[k])}" style="margin-right:6px"><strong>${Math.round(sm.scores[k])}</strong> ${label}</div>`).join("");
   const sounds = (ph) => ph.map((p) => `<span class="chip ${scoreClass(p.s)}" style="padding:0 6px;margin-right:3px">${esc(p.p)} ${Math.round(p.s)}</span>`).join("");
   const words = sm.worst_words.map((w, i) => `<div class="small" style="margin:6px 0"><strong>${sayable(w.word)}</strong> <span class="muted">${Math.round(w.score)}${w.times > 1 ? ` · weak ${w.times} times` : ""}</span>
-      ${w.unit === "s" ? ` <button class="secondary play" data-t="${w.t}" style="padding:0 8px">Listen</button>` : ""}<br>${sounds(w.sounds)}</div>`).join("");
+      <span class="hear"><button class="secondary mini" data-say="${esc(w.word)}" title="Hear the app say it">Model</button><button class="secondary mini" data-clip="/api/sessions/${esc(detail.id)}/clip?unit=${encodeURIComponent(w.unit)}&t=${w.t}&d=${w.d || 1}" title="Hear yourself say it">You</button></span><br>${sounds(w.sounds)}</div>`).join("");
   const weak = sm.weak_sounds.map((x) => `<li class="small"><strong>/${esc(x.sound)}/</strong> <span class="muted">average ${Math.round(x.mean)} in ${x.count} words${x.words.length ? `, for example ${x.words.map((w) => sayable(w)).join(", ")}` : ""}</span></li>`).join("");
   const earClips = r.ear ? r.ear.clips.map((c) => `<div class="small" style="margin:6px 0"><strong>${sayable(c.word)}</strong> <span class="muted">sounds like</span> ${esc(c.heard)}<br>${sayQuoted(c.issue)}${c.fix ? `<br><span class="muted">Try:</span> ${sayQuoted(c.fix)}` : ""}</div>`).join("") : "";
-  const ear = r.ear ? `<p class="small muted" style="margin:10px 0 0">What an audio model heard when it listened to those words (${esc(r.ear.model)}):</p>${earClips}${r.ear.overall ? `<p class="small">${esc(r.ear.overall)}</p>` : ""}<p class="small muted">An AI model listening is less reliable than the scores above and can be wrong about a word. Trust a tip only if you can hear it yourself with “Listen”.</p>`
+  const ear = r.ear ? `<p class="small muted" style="margin:10px 0 0">What an audio model heard when it listened to those words (${esc(r.ear.model)}):</p>${earClips}${r.ear.overall ? `<p class="small">${esc(r.ear.overall)}</p>` : ""}<p class="small muted">An AI model listening is less reliable than the scores above and can be wrong about a word. Trust a tip only if you can hear it yourself: click a word to hear the app say it, and “You” to hear yourself.</p>`
     : r.ear_pending ? `<p class="small muted" style="margin:10px 0 0">An audio model is listening to the weakest words…</p>` : "";
   box.innerHTML = `<h3>Pronunciation</h3>
     <div style="margin:6px 0">${tiles}</div>
@@ -715,14 +726,7 @@ function renderPron(box, r, detail) {
     ${ear}
     <p class="small muted">Scored from the audio by Azure Speech, not from the transcript, so it hears what you really said. It judges against a standard accent: a different accent is not an error, so treat the scores as a guide. ${sm.n_words} words, ${Math.round(sm.seconds)} s.</p>
     <button class="secondary" id="pron-again" style="margin-top:4px">Score again</button>`;
-  const audio = $("#sess-audio", document);
   if (r.ear_pending) setTimeout(() => { if (document.body.contains(box)) setupPron(box.parentElement, detail); }, 2500);
-  box.querySelectorAll("button.play").forEach((b) => b.addEventListener("click", () => {
-    if (!audio) return;
-    audio.currentTime = Math.max(0, Number(b.dataset.t) - 0.15);
-    audio.play();
-    setTimeout(() => audio.pause(), 1400);
-  }));
   $("#pron-again", box).addEventListener("click", async () => {
     try { await api(`/api/sessions/${detail.id}/pronunciation`, { method: "POST" }); } catch (_) {}
     setupPron(box.parentElement, detail);
