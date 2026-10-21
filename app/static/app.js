@@ -83,6 +83,7 @@ async function api(path, options = {}) {
     opts.body = JSON.stringify(opts.body);
   }
   const res = await fetch(path, opts);
+  if (res.status === 401 && !path.startsWith("/api/login")) { location.href = "/login"; throw new Error("Login required"); }  // the app is protected by a password
   if (!res.ok) {
     let detail = res.statusText;
     try { const j = await res.json(); detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch (_) {}
@@ -260,8 +261,18 @@ function pickMime() {
   return options.find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || "";
 }
 
-function closeOverlay() { document.body.classList.remove("busy"); overlay.hidden = true; overlay.innerHTML = ""; document.body.style.overflow = ""; }
-function openOverlay(html) { document.body.classList.add("busy"); overlay.hidden = false; document.body.style.overflow = "hidden"; overlay.innerHTML = `<div class="inner">${html}</div>`; return overlay.firstElementChild; }
+// While a recording or a conversation is open the screen must not go to sleep (an iPad does after a minute or two).
+let awakeLock = null, awakeOn = false;
+async function wakeRequest() {
+  try { if (awakeOn && navigator.wakeLock && document.visibilityState === "visible") awakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") wakeRequest(); });
+function holdAwake(on) {
+  awakeOn = on;
+  if (on) wakeRequest(); else { try { if (awakeLock) awakeLock.release(); } catch (_) {} awakeLock = null; }
+}
+function closeOverlay() { holdAwake(false); document.body.classList.remove("busy"); overlay.hidden = true; overlay.innerHTML = ""; document.body.style.overflow = ""; }
+function openOverlay(html) { holdAwake(true); document.body.classList.add("busy"); overlay.hidden = false; document.body.style.overflow = "hidden"; overlay.innerHTML = `<div class="inner">${html}</div>`; return overlay.firstElementChild; }
 
 // ---------------------------------------------------------------- plan: phrases to aim for in a free talk or drill
 // Never used in baseline tests: any help there would change the measurement.
@@ -987,6 +998,33 @@ async function pronunciationProgressHtml() {
 // ---------------------------------------------------------------- settings
 const SETTINGS_CHECKS = { stt: [["stt", "Check the key"]], llm: [["llm", "Check feedback model"], ["chat", "Check conversation model"]], voice: [["voice", "Check the voice"]], pron: [["azure", "Check Azure"], ["audio", "Check audio model"]] };
 
+async function renderAccess(box) {
+  let st;
+  try { st = await api("/api/auth/status"); } catch (_) { return; }
+  const secure = location.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  box.innerHTML = `<details class="card fold" ${st.enabled ? "" : "open"}><summary><h3>Access</h3><span class="small muted">${st.enabled ? "protected by a password" : "this computer only, no password"}</span></summary>
+    <p class="muted small" style="margin-top:0">By default only this computer can open the app. To use it from another device (an iPad, for example) it needs a password, and the connection must be https, or the browser will refuse the microphone. The steps are in <code>docs/remote-access.md</code>. The password is stored only as a salted hash, and the app refuses to listen on the network without one.</p>
+    ${secure ? "" : `<p class="err small">You are on an unencrypted connection (${esc(location.protocol)}//${esc(location.host)}): do not type a password here.</p>`}
+    <div style="margin:10px 0"><label for="pw1"><strong>${st.enabled ? "New password" : "Password"}</strong></label><br><input type="password" id="pw1" autocomplete="new-password" size="34" placeholder="at least 12 characters"><div class="small muted">A short phrase of a few words is easier to remember than symbols.</div></div>
+    <div style="margin:10px 0"><label for="pw2"><strong>Again</strong></label><br><input type="password" id="pw2" autocomplete="new-password" size="34"></div>
+    <div class="row"><button class="primary" id="pw-set">${st.enabled ? "Change the password" : "Set the password"}</button>${st.enabled ? `<button class="secondary" id="pw-remove">Remove the password</button><button class="secondary" id="pw-logout">Log out of this browser</button>` : ""}<span class="small" id="pw-msg"></span></div>
+    <p class="small muted">Changing or removing the password logs every other browser out.</p></details>`;
+  const msg = (t, bad) => { $("#pw-msg", box).innerHTML = bad ? `<span class="err">${esc(t)}</span>` : esc(t); };
+  $("#pw-set", box).addEventListener("click", async () => {
+    const a = $("#pw1", box).value, b = $("#pw2", box).value;
+    if (a !== b) { msg("The two passwords are not the same.", true); return; }
+    try { await api("/api/auth/password", { method: "POST", body: { password: a } }); logEvent("password_set"); renderAccess(box); }
+    catch (e) { msg(e.message, true); }
+  });
+  const rm = $("#pw-remove", box);
+  if (rm) rm.addEventListener("click", async () => {
+    if (!confirm("Remove the password? Anyone who can reach the app will be able to open it.")) return;
+    try { await api("/api/auth/password", { method: "POST", body: { password: null } }); renderAccess(box); } catch (e) { msg(e.message, true); }
+  });
+  const lo = $("#pw-logout", box);
+  if (lo) lo.addEventListener("click", async () => { await fetch("/api/logout", { method: "POST" }); location.href = "/login"; });
+}
+
 async function renderSettings() {
   let r;
   try { r = await api("/api/settings"); }
@@ -1011,9 +1049,10 @@ async function renderSettings() {
   const groups = r.groups.map((g) => `<details class="card fold" ${g.fields.some((f) => f.pending) ? "open" : ""}><summary><h3>${esc(g.title)}</h3><span class="small muted">${esc(brief(g))}</span></summary><p class="muted small" style="margin-top:0">${esc(g.blurb)}</p>${g.fields.map(input).join("")}
     ${(SETTINGS_CHECKS[g.id] || []).length ? `<div class="row">${SETTINGS_CHECKS[g.id].map(([svc, label]) => `<button class="secondary" data-check="${svc}">${label}</button>`).join("")}</div>${SETTINGS_CHECKS[g.id].map(([svc]) => `<div class="small" data-res="${svc}" style="margin-top:6px"></div>`).join("")}` : ""}</details>`).join("");
   view.innerHTML = `<h2>Settings</h2><p class="lead">Everything the app needs to work, in one place. It is saved in the <code>.env</code> file next to the app (${esc(r.env_file)}): keys stay on this computer and are never shown again here, only their last four characters. A change applies after a restart.</p>
-    <div id="st-banner"></div>${groups}
+    <div id="st-banner"></div>${groups}<div id="st-access"></div>
     <div class="row" style="margin:14px 0"><button class="primary" id="st-save">Save</button><span class="small muted" id="st-msg"></span></div>`;
 
+  renderAccess($("#st-access"));
   const collect = () => {
     const values = {}, clear = [];
     view.querySelectorAll("[data-key]").forEach((el) => { values[el.dataset.key] = el.value; });

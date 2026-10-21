@@ -70,6 +70,10 @@ Limits to keep in mind: the model sees only the transcript, so on a short or unc
 
 Playful, colourful interface: cream paper with a dot grid, thick outlines, chunky buttons, a colour per tab, and a light or dark switch (top right, remembered in the browser). The Outfit font is bundled in `app/static/fonts` (SIL Open Font License, text included), so nothing is loaded from the internet. Decorative shapes and speech bubbles appear in the margins on wide screens only. Small animations (floating shapes, cards that pop in, confetti when a session or a review ends) are switched off when your device asks for reduced motion, and nothing moves during a recording. Every decorative shape floats gently. At load the app also measures its own frame rate for two seconds; below 45 frames per second it switches the decorative motion off ("calm" mode) and logs a `client.perf_check` event with the measured rate and browser, so you can see in the log where it was slow. Tested in Chromium only: Firefox and Safari were not available here.
 
+## Using it from another device
+
+See `docs/remote-access.md`. In short: set a password in Settings, Access (the app refuses to listen on the network without one), reach the app over https (Tailscale is the simplest way), then on an iPad use Safari, Share, Add to Home Screen. It is checked and tested on a desktop browser only.
+
 ## Layout
 
 Pages were getting long, so they are organised by what you do most. **Today** starts with the conversation (scenario, length and Start on one line; the turn-taking, interruption and web-search options are folded under "Options"), then the free monologue and the 4/3/2 drill side by side, then the 30 day tests, each folded and open only when it is due. A **session** opens on tabs: Result, Transcript, Pronunciation, Feedback, Notes. **Settings** and the secondary parts of **Progress** are folded blocks with a one-line summary. Measured on your data at 1280x800: Today went from 3.7 to 2.3 screens, a session from 4.1 to at most 1.5 per tab (the transcript itself is 2.6), Settings from 4.1 to 1.2. No page scrolls sideways at 768 px (iPad) or 375 px (phone).

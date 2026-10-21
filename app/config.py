@@ -55,6 +55,9 @@ class Settings:
     audio_model: str = "google/gemini-3.1-flash-lite"
     audio_key: str = ""
     native_language: str = "French"
+    app_password_hash: str = ""
+    tls_cert: str = ""
+    tls_key: str = ""
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
@@ -95,6 +98,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         azure_speech_region=env.get("AZURE_SPEECH_REGION", "").strip().lower(),
         pron_locale=env.get("PRONUNCIATION_LOCALE", "en-US").strip(),
         pron_concurrency=int(env.get("PRONUNCIATION_CONCURRENCY", "1")),
+        app_password_hash=env.get("APP_PASSWORD_HASH", "").strip(),
+        tls_cert=env.get("TLS_CERT", "").strip(),
+        tls_key=env.get("TLS_KEY", "").strip(),
         native_language=env.get("NATIVE_LANGUAGE", "French").strip() or "French",
         audio_model=env.get("AUDIO_COACH_MODEL", "google/gemini-3.1-flash-lite").strip(),
         audio_key=env.get("AUDIO_COACH_KEY", "").strip() or (

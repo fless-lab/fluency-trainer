@@ -12,6 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import date as Date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Literal
 
 import httpx
@@ -34,6 +35,7 @@ from . import config
 from .config import ROOT, Settings, load_settings
 from . import settings_admin as sadm
 from . import backup as bk
+from . import auth
 from .db import DB
 from .eventlog import EventLog, utcnow
 from .metrics import METRICS_VERSION, compute_metrics
@@ -113,6 +115,14 @@ class NotebookIn(BaseModel):
 class SettingsIn(BaseModel):
     values: dict[str, Any] = Field(default_factory=dict)
     clear: list[str] = Field(default_factory=list)
+
+
+class LoginIn(BaseModel):
+    password: str = Field(default="", max_length=500)
+
+
+class PasswordIn(BaseModel):
+    password: str | None = Field(default=None, max_length=500)
 
 
 class TargetsIn(BaseModel):
@@ -318,6 +328,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Fluency Trainer", version=APP_VERSION, lifespan=lifespan)
     app.state.db, app.state.events, app.state.settings = db, events, settings
     app.state.process_session = process_session
+
+    # access: open by default; with a password every request needs the cookie that a good login gives ---------------
+    class AuthState:
+        password_hash = settings.app_password_hash
+        tokens = auth.Tokens(auth.load_secret(data / "secret.key"))
+        limiter = auth.RateLimiter()
+    PUBLIC = {"/login", "/api/login", "/api/logout", "/api/auth/status"}
+    UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
+
+    def client_key(request: Request) -> str:
+        fwd = request.headers.get("x-forwarded-for", "")
+        return fwd.split(",")[0].strip() or (request.client.host if request.client else "?")
+
+    def is_authed(request: Request) -> bool:
+        return not AuthState.password_hash or AuthState.tokens.valid(request.cookies.get(auth.COOKIE))
+
+    def set_cookie(response: Response, request: Request) -> None:
+        secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        response.set_cookie(auth.COOKIE, AuthState.tokens.issue(), max_age=auth.SESSION_DAYS * 86400, httponly=True,
+                            samesite="lax", secure=secure, path="/")
+
+    @app.middleware("http")
+    async def gate(request: Request, call_next):
+        path = request.url.path
+        if request.method in UNSAFE:  # a page on another site must not be able to act for you, password or not
+            origin = request.headers.get("origin")
+            if origin and origin != "null":
+                allowed = {request.headers.get("host", ""), request.headers.get("x-forwarded-host", "")}
+                if urlparse(origin).netloc not in allowed:
+                    return JSONResponse({"detail": "cross-site request refused"}, status_code=403)
+        if path in PUBLIC or path.startswith("/static/") or is_authed(request):
+            return await call_next(request)
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "login required"}, status_code=401)
+        return FileResponse(STATIC_DIR / "login.html", status_code=200)
 
     @app.middleware("http")
     async def audit(request: Request, call_next):
@@ -607,6 +652,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "nothing at that time")
         return Response(pron.to_wav(seg), media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
 
+    # login ----------------------------------------------------------------------------------------------
+    @app.get("/login")
+    def login_page() -> FileResponse:
+        return FileResponse(STATIC_DIR / "login.html")
+
+    @app.get("/api/auth/status")
+    def auth_status(request: Request) -> dict[str, Any]:
+        return {"enabled": bool(AuthState.password_hash), "authed": is_authed(request)}
+
+    @app.post("/api/login")
+    def login(body: LoginIn, request: Request) -> Response:
+        key = client_key(request)
+        wait = AuthState.limiter.wait(key)
+        if wait:
+            events.write("auth.blocked", None, wait=wait)
+            return JSONResponse({"detail": f"Too many wrong passwords. Try again in {wait} s."}, status_code=429, headers={"Retry-After": str(wait)})
+        if AuthState.password_hash and not auth.verify_password(body.password, AuthState.password_hash):
+            AuthState.limiter.failed(key)
+            events.write("auth.failed", None)
+            return JSONResponse({"detail": "Wrong password."}, status_code=401)
+        AuthState.limiter.ok(key)
+        response = JSONResponse({"ok": True})
+        if AuthState.password_hash:
+            set_cookie(response, request)
+            events.write("auth.login", None)
+        return response
+
+    @app.post("/api/logout")
+    def logout() -> Response:
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(auth.COOKIE, path="/")
+        return response
+
+    @app.post("/api/auth/password")
+    def set_password(body: PasswordIn, request: Request) -> Response:
+        """Set, change or remove the password. Only from this computer. Changing it logs every other browser out."""
+        local_only(request)
+        if body.password:
+            weak = auth.check_strength(body.password)
+            if weak:
+                raise HTTPException(422, weak)
+            new_hash = auth.hash_password(body.password)
+        else:
+            new_hash = ""
+        sadm.write_env(env_path, {"APP_PASSWORD_HASH": new_hash})
+        AuthState.password_hash = new_hash
+        AuthState.tokens = auth.Tokens(auth.load_secret(data / "secret.key", rotate=True))
+        events.write("auth.password_changed", None, enabled=bool(new_hash))
+        response = JSONResponse({"enabled": bool(new_hash)})
+        if new_hash:
+            set_cookie(response, request)  # this browser stays logged in
+        return response
+
     # backups -----------------------------------------------------------------------------------------
     backup_dir = data / "backups"
 
@@ -651,7 +749,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def local_only(request: Request) -> None:
         """The settings hold keys and can restart the app: only the machine it runs on may use them."""
-        if (request.client.host if request.client else "") not in LOCAL_HOSTS:
+        if (request.client.host if request.client else "") not in LOCAL_HOSTS or auth.through_proxy(request.headers):
             raise HTTPException(403, "The settings can only be changed from the computer the app runs on.")
 
     @app.get("/api/settings")
