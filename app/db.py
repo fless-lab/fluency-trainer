@@ -366,6 +366,17 @@ class DB:
                        latency_ms, speech_ms, utcnow()))
         return idx
 
+    def set_turn_text(self, sid: str, idx: int, text: str) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE conv_turns SET text = ? WHERE session_id = ? AND idx = ?", (text, sid, idx))
+
+    def set_turn_words(self, sid: str, idx: int, words: list, text: str | None = None) -> None:
+        with self.conn() as c:
+            if text:
+                c.execute("UPDATE conv_turns SET words = ?, text = ? WHERE session_id = ? AND idx = ?", (json.dumps(words), text, sid, idx))
+            else:
+                c.execute("UPDATE conv_turns SET words = ? WHERE session_id = ? AND idx = ?", (json.dumps(words), sid, idx))
+
     def get_turns(self, sid: str) -> list[dict[str, Any]]:
         with self.conn() as c:
             rows = c.execute("SELECT * FROM conv_turns WHERE session_id = ? ORDER BY idx", (sid,)).fetchall()

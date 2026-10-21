@@ -38,3 +38,9 @@ class MockLLM:
             "focus_next": "Mock focus.",
         }
         return LLMResult("mock", "mock", json.dumps(answer), {"input_tokens": 0, "output_tokens": 0})
+
+    async def stream(self, system: str, user: str, max_tokens: int):
+        r = await self.complete(system, user, max_tokens)
+        words = r.text.split(" ")
+        for i, w in enumerate(words):
+            yield w + (" " if i < len(words) - 1 else "")

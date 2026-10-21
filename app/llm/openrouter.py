@@ -9,6 +9,9 @@ raised as an LLMError, shown in the session and written to the event log.
 
 from __future__ import annotations
 
+import json
+from typing import AsyncIterator
+
 import httpx
 
 from .base import LLMError, LLMResult
@@ -43,3 +46,29 @@ class OpenRouterLLM:
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"openrouter: unexpected response: {r.text[:800]}") from exc
         return LLMResult(self.name, self.model, text, data.get("usage") or {})
+
+    async def stream(self, system: str, user: str, max_tokens: int) -> AsyncIterator[str]:
+        """Yield the answer piece by piece (server sent events with choices[0].delta.content, ending with [DONE])."""
+        body = {"model": self.model, "max_tokens": max_tokens, "stream": True,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("POST", f"{self.base}/chat/completions", json=body,
+                                         headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+                    if r.status_code >= 400:
+                        raise LLMError(f"openrouter: HTTP {r.status_code}: {(await r.aread()).decode('utf-8', 'replace')[:800]}")
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            ev = json.loads(payload)
+                            piece = (ev.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
+                        except (ValueError, AttributeError):
+                            continue
+                        if piece:
+                            yield piece
+        except httpx.HTTPError as exc:
+            raise LLMError(f"openrouter: network error: {exc}") from exc

@@ -70,3 +70,32 @@ def stitch(user_turns: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str,
 def delays(turns: list[dict[str, Any]]) -> list[int]:
     """Response delay of each user turn after the partner finished, in ms (None values skipped)."""
     return [t["latency_ms"] for t in turns if t["role"] == "user" and t.get("latency_ms") is not None]
+
+
+MIN_SENTENCE_CHARS = 14
+
+
+def split_ready(buffer: str, final: bool = False) -> tuple[list[str], str]:
+    """Cut complete sentences off the front of a growing buffer.
+
+    A sentence ends at . ! or ? followed by a space (or the end of the text when final). Pieces shorter than
+    MIN_SENTENCE_CHARS are kept and joined to the next one, so the voice never speaks a lone "Oh." The first
+    sentence is released as early as possible, since that is what starts the voice.
+    """
+    out: list[str] = []
+    start, i = 0, 0
+    while i < len(buffer):
+        if buffer[i] in ".!?" and (i + 1 == len(buffer) and final or (i + 1 < len(buffer) and buffer[i + 1] in " \n")):
+            piece = buffer[start:i + 1].strip()
+            if len(piece) >= MIN_SENTENCE_CHARS:
+                out.append(piece)
+                start = i + 1
+        i += 1
+    rest = buffer[start:]
+    if final and rest.strip():
+        if out and len(rest.strip()) < MIN_SENTENCE_CHARS:
+            out[-1] = out[-1] + " " + rest.strip()
+        else:
+            out.append(rest.strip())
+        rest = ""
+    return out, rest.lstrip()

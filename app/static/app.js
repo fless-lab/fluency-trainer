@@ -854,6 +854,83 @@ function playUrl(url, onBlocked) {
   });
 }
 
+// Live transcription: audio goes from the microphone straight to AssemblyAI over a websocket, with a short-lived
+// token from our server. It only makes the reply start sooner. The timed words used for the measures still come from
+// the normal transcription of each recording, done in the background.
+const LIVE_MIN_FRAME = 1600;  // 100 ms at 16 kHz
+class LiveSTT {
+  constructor(ctx, stream) { this.ctx = ctx; this.stream = stream; this.ws = null; this.ready = false; this.sending = false; this.buffered = []; this.turns = {}; this.carry = []; this.pos = 0; this.pending = []; }
+  async init() {
+    if (!this.ctx.audioWorklet) return false;
+    const src = "class P extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true}}registerProcessor('pcm-tap',P);";
+    const url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+    try { await this.ctx.audioWorklet.addModule(url); } catch (_) { return false; }
+    this.node = new AudioWorkletNode(this.ctx, "pcm-tap");
+    this.node.port.onmessage = (e) => this.onAudio(e.data);
+    const mute = this.ctx.createGain(); mute.gain.value = 0;
+    this.ctx.createMediaStreamSource(this.stream).connect(this.node); this.node.connect(mute); mute.connect(this.ctx.destination);
+    return true;
+  }
+  onAudio(f32) {
+    if (!this.sending) return;
+    const ratio = this.ctx.sampleRate / 16000;
+    for (let i = 0; i < f32.length; i++) {
+      this.pos += 1;
+      if (this.pos >= ratio) { this.pos -= ratio; this.carry.push(Math.max(-1, Math.min(1, f32[i]))); }
+    }
+    while (this.carry.length >= LIVE_MIN_FRAME) {
+      const frame = this.carry.splice(0, LIVE_MIN_FRAME), i16 = new Int16Array(frame.length);
+      for (let i = 0; i < frame.length; i++) i16[i] = frame[i] < 0 ? frame[i] * 0x8000 : frame[i] * 0x7fff;
+      if (this.ready) this.ws.send(i16.buffer); else if (this.buffered.length < 80) this.buffered.push(i16.buffer);
+    }
+  }
+  async begin() {  // called while the partner talks, so the connection is ready when the person starts
+    this.close(); this.turns = {}; this.carry = []; this.buffered = []; this.ready = false; this.terminated = null;
+    try {
+      const t = await api("/api/conversations/stream-token");
+      const ws = new WebSocket(`${t.url}?sample_rate=16000&token=${encodeURIComponent(t.token)}`);
+      this.ws = ws;
+      ws.onmessage = (e) => {
+        let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+        if (m.type === "Turn" && typeof m.turn_order === "number") this.turns[m.turn_order] = m.transcript || "";
+        if (m.type === "Termination" && this.terminated) this.terminated();
+      };
+      await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error("websocket")); setTimeout(() => rej(new Error("timeout")), 4000); });
+      this.ready = true;
+      for (const b of this.buffered) ws.send(b);
+      this.buffered = [];
+    } catch (e) { logEvent("live_stt_unavailable", { error: String(e) }); this.ready = false; }
+  }
+  listen() { this.sending = true; }
+  async finish() {  // stop sending, ask AssemblyAI to close the open turn, and return everything it heard
+    this.sending = false;
+    if (this.ready && this.ws && this.ws.readyState === 1) {
+      const done = new Promise((r) => { this.terminated = r; setTimeout(r, 1500); });
+      try { this.ws.send(JSON.stringify({ type: "Terminate" })); } catch (_) {}
+      await done;
+    }
+    const text = Object.keys(this.turns).map(Number).sort((x, y) => x - y).map((k) => this.turns[k]).join(" ").replace(/\s+/g, " ").trim();
+    this.close();
+    return text;
+  }
+  close() { try { if (this.ws) this.ws.close(); } catch (_) {} this.ws = null; this.ready = false; }
+}
+
+async function readNdjson(response, onEvent) {
+  const reader = response.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+      if (line) { const stop = await onEvent(JSON.parse(line)); if (stop === "stop") { try { await reader.cancel(); } catch (_) {} return; } }
+    }
+  }
+}
+
 async function runConversation(scenario, minutes, patienceMs) {
   const info = { ua: navigator.userAgent, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, screen: `${screen.width}x${screen.height}` };
   let stream;
@@ -864,45 +941,63 @@ async function runConversation(scenario, minutes, patienceMs) {
   let sid = null, over = false, doneNow = false, ending = false;
   const stopMic = () => stream.getTracks().forEach((t) => t.stop());
   $("#cancel", box).addEventListener("click", () => { over = true; stopMic(); window.speechSynthesis && window.speechSynthesis.cancel(); closeOverlay(); show(currentTab); });
+
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  try { await ctx.resume(); } catch (_) {}
+  const cfg = await api("/api/conversations/config").catch(() => ({}));
+  const live = cfg.live_stt ? new LiveSTT(ctx, stream) : null;
+  const liveOk = live ? await live.init() : false;
+
+  // the partner's first line
   let first;
   try { first = await api("/api/conversations", { method: "POST", body: { scenario, minutes, client_info: info } }); }
   catch (e) { stopMic(); stage.innerHTML = `<p class="err">Could not start: ${esc(e.message)}</p>`; return; }
   sid = first.id;
-  logEvent("conv_opened", { patience_ms: patienceMs, minutes }, sid);
+  logEvent("conv_opened", { patience_ms: patienceMs, minutes, live_stt: liveOk }, sid);
   stage.innerHTML = `<div id="say" class="saybox"></div><p class="muted" id="state"></p><div class="clock small" id="clock">00:00</div><div class="row"><button class="primary" id="done-turn" hidden>I'm done talking</button><button class="secondary" id="end">End and get feedback</button></div><p class="small muted" id="vnote"></p>`;
-  const say = $("#say", stage), stateEl = $("#state", stage), doneBtn = $("#done-turn", stage);
-  const add = (who, text) => { const d = document.createElement("div"); d.className = `say-${who}`; d.textContent = text; say.appendChild(d); say.scrollTop = say.scrollHeight; };
+  const say = $("#say", stage), stateEl = $("#state", stage), doneBtn = $("#done-turn", stage), note = $("#vnote", stage);
+  const add = (who, text) => { const d = document.createElement("div"); d.className = `say-${who}`; d.textContent = text; say.appendChild(d); say.scrollTop = say.scrollHeight; return d; };
   $("#end", stage).addEventListener("click", () => { ending = true; doneNow = true; });
   doneBtn.addEventListener("click", () => { doneNow = true; });
 
-  // voice-activity detection: simple loudness threshold, calibrated on the room noise
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
-  try { await ctx.resume(); } catch (_) {}
+  // loudness-based voice detection, calibrated on the room noise: decides when you started and when you went quiet
   const analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
   ctx.createMediaStreamSource(stream).connect(analyser);
   const buf = new Float32Array(analyser.fftSize);
   const level = () => { analyser.getFloatTimeDomainData(buf); let s = 0; for (const v of buf) s += v * v; return Math.sqrt(s / buf.length); };
-  await sleep(400);
+  await sleep(300);
   let ambient = 0; for (let i = 0; i < 6; i++) { ambient = Math.max(ambient, level()); await sleep(50); }
   const threshold = Math.min(0.08, Math.max(0.02, ambient * 3));
   const t0 = performance.now();
   const tick = setInterval(() => { const c = $("#clock", stage); if (c) c.textContent = mmss((performance.now() - t0) / 1000); }, 500);
 
-  let partnerEndedAt = performance.now();
-  const hear = async (turn) => {
-    add("partner", turn.text);
-    stateEl.textContent = "Your partner is speaking…"; doneBtn.hidden = true;
-    const note = $("#vnote", stage); if (note) note.textContent = turn.audio_url ? "" : (turn.voice_note || "");
-    if (turn.audio_url) await playUrl(turn.audio_url, () => { if (note) note.textContent = "Your browser blocked the sound. Click anywhere, then it works."; });
-    else await speakBrowser(turn.text);
-    partnerEndedAt = performance.now();
+  // The partner's sentences are played in order, as they arrive.
+  const makePlayer = () => {
+    const queue = []; let finished = false, wake = null, bubble = null, text = "";
+    const run = (async () => {
+      for (;;) {
+        if (queue.length) {
+          const sn = queue.shift();
+          if (!bubble) bubble = add("partner", ""); text = (text + " " + sn.text).trim(); bubble.textContent = text; say.scrollTop = say.scrollHeight;
+          note.textContent = sn.audio_url ? "" : (sn.voice_note || "");
+          if (sn.audio_url) await playUrl(sn.audio_url, () => { note.textContent = "Your browser blocked the sound. Click anywhere, then it works."; });
+          else await speakBrowser(sn.text);
+        } else if (finished) break;
+        else await new Promise((r) => { wake = r; });
+      }
+    })();
+    return { push: (sn) => { queue.push(sn); if (wake) { const w = wake; wake = null; w(); } }, end: () => { finished = true; if (wake) { const w = wake; wake = null; w(); } }, done: run };
   };
-  await hear(first.turn);
+  let partnerEndedAt = performance.now();
+  stateEl.textContent = "Your partner is speaking…";
+  if (liveOk) live.begin();
+  { const pl = makePlayer(); first.sentences.forEach(pl.push); pl.end(); await pl.done; partnerEndedAt = performance.now(); }
 
   while (!over) {
-    // one user turn: wait for speech, record, stop after a patient silence or on the button
     stateEl.textContent = "Your turn. Take your time."; doneBtn.hidden = false; doneNow = false;
-    const rec = new MediaRecorder(stream, pickMime() ? { mimeType: pickMime() } : undefined);
+    if (liveOk) live.listen();
+    const mt = pickMime();
+    const rec = new MediaRecorder(stream, mt ? { mimeType: mt } : undefined);
     const chunks = []; rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
     rec.start(500);
     const turnStart = performance.now();
@@ -917,24 +1012,37 @@ async function runConversation(scenario, minutes, patienceMs) {
     const durationS = (performance.now() - turnStart) / 1000;
     await new Promise((resolve) => { rec.onstop = resolve; if (rec.state !== "inactive") rec.stop(); });
     if (over) break;
-    if (!spoke) { if (ending) break; continue; }  // nothing said: keep waiting without sending anything
+    if (!spoke) { if (ending) break; continue; }  // nothing said: keep waiting, nothing is sent
     stateEl.textContent = "…"; doneBtn.hidden = true;
+    const liveText = liveOk ? await live.finish() : "";
     const fd = new FormData();
     fd.append("file", new Blob(chunks, { type: rec.mimeType || "audio/webm" }), "turn.webm");
     fd.append("duration_s", String(durationS)); fd.append("mime", (rec.mimeType || "audio/webm").split(";")[0]);
     fd.append("latency_ms", String(Math.round(firstSpeechAt - partnerEndedAt)));
-    let out;
-    try { const r = await fetch(`/api/conversations/${sid}/turn`, { method: "POST", body: fd }); out = await r.json(); if (!r.ok) throw new Error(out.detail || r.statusText); }
-    catch (e) { stateEl.innerHTML = `<span class="err">${esc(e.message)}</span> Say it again, or end the conversation.`; logEvent("conv_turn_failed", { error: String(e) }, sid); if (ending) break; continue; }
-    if (out.empty) { stateEl.textContent = "I did not catch any words. Try again."; if (ending) break; continue; }
-    add("user", out.user_text);
-    if (ending) break;
-    await hear(out.turn);
-    if ((performance.now() - t0) / 60000 >= minutes) break;
+    fd.append("live_text", liveText);
+    const sentAt = performance.now();
+    let gotAudio = false, errMsg = null, empty = false;
+    try {
+      const r = await fetch(`/api/conversations/${sid}/turn`, { method: "POST", body: fd });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || r.statusText); }
+      if (liveOk && !ending) live.begin();  // reconnect while the partner answers
+      stateEl.textContent = "Your partner is answering…";
+      const pl = makePlayer();
+      await readNdjson(r, async (ev) => {
+        if (ev.type === "empty") { empty = true; }
+        else if (ev.type === "user") { add("user", ev.text); if (ending) return "stop"; }
+        else if (ev.type === "sentence") { if (!gotAudio) { gotAudio = true; logEvent("conv_first_sentence", { ms_after_send: Math.round(performance.now() - sentAt) }, sid); } pl.push(ev); }
+        else if (ev.type === "error") { errMsg = ev.message; }
+      });
+      pl.end(); await pl.done; partnerEndedAt = performance.now();
+    } catch (e) { errMsg = e.message; logEvent("conv_turn_failed", { error: String(e) }, sid); }
+    if (empty) { stateEl.textContent = "I did not catch any words. Try again."; if (ending) break; if (liveOk) live.begin(); continue; }
+    if (errMsg) { stateEl.innerHTML = `<span class="err">${esc(errMsg)}</span> Say it again, or end the conversation.`; if (liveOk && !ending) live.begin(); if (ending) break; continue; }
+    if (ending || (performance.now() - t0) / 60000 >= minutes) break;
   }
-  clearInterval(tick); stopMic(); ctx.close();
+  clearInterval(tick); stopMic(); if (live) live.close(); ctx.close();
   if (over) return;
-  stage.innerHTML = `<p class="muted">Finishing…</p>`;
+  stage.innerHTML = `<p class="muted">Finishing… the last recordings are being transcribed.</p>`;
   const end = await api(`/api/conversations/${sid}/end`, { method: "POST", body: {} }).catch((e) => ({ status: "error", error: e.message }));
   if (end.status === "error") { stage.innerHTML = `<p class="err">${esc(end.error || "No speech was captured.")}</p><button class="primary" id="done">Close</button>`; $("#done", stage).addEventListener("click", () => { closeOverlay(); show("today"); }); return; }
   logEvent("conv_ended", { delays_ms: end.delays_ms }, sid);

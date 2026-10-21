@@ -12,13 +12,14 @@ from datetime import date as Date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import APP_VERSION
-from .conversation import CONV_VERSION, SYSTEM as CONV_SYSTEM, clean_reply, delays, opening_prompt, reply_prompt, stitch
+from .conversation import CONV_VERSION, SYSTEM as CONV_SYSTEM, delays, opening_prompt, reply_prompt, split_ready, stitch
 from .patterns import build_patterns
 from .tts.base import TTSError
 from .tts.mock import MockTTS
@@ -538,6 +539,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     conv_dir = data / "conv"
     conv_dir.mkdir(parents=True, exist_ok=True)
     conv_locks: dict[str, asyncio.Lock] = {}
+    conv_tasks: dict[str, list[asyncio.Task]] = {}
 
     def day_ago() -> str:
         return (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="milliseconds")
@@ -548,63 +550,125 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(409, "this session is not a conversation")
         return s
 
-    async def partner_say(sid: str, text: str) -> dict[str, Any]:
-        """Store the partner's line and make its audio when a voice is configured."""
-        idx = db.add_turn(sid, "partner", text)
-        audio_url, tts_note = None, tts_error
-        if tts is not None:
-            if db.tts_characters_since(day_ago()) + len(text) > settings.tts_max_chars_per_day:
-                events.write("tts.cap_reached", sid, cap=settings.tts_max_chars_per_day)
-                tts_note = f"Daily voice cap reached (TTS_MAX_CHARS_PER_DAY={settings.tts_max_chars_per_day}); the browser voice is used."
-            else:
-                try:
-                    started = time.monotonic()
-                    r = await tts.speak(text)
-                    ext = ".mp3" if "mpeg" in r.mime else ".wav" if "wav" in r.mime else ".bin"
-                    path = conv_dir / f"{sid}_{idx}{ext}"
-                    path.write_bytes(r.audio)
-                    with db.conn() as c:
-                        c.execute("UPDATE conv_turns SET audio_path = ? WHERE session_id = ? AND idx = ?", (str(path), sid, idx))
-                    db.log_tts_call(sid, r.provider, r.model, r.characters)
-                    events.write("tts.done", sid, idx=idx, characters=r.characters, provider=r.provider, model=r.model,
-                                 seconds=round(time.monotonic() - started, 2))
-                    audio_url, tts_note = f"/api/conversations/{sid}/turns/{idx}/audio", None
-                except TTSError as exc:
-                    events.write("tts.error", sid, idx=idx, error=str(exc))
-                    tts_note = str(exc)
-        return {"idx": idx, "text": text, "audio_url": audio_url, "voice_note": tts_note}
+    async def speak_part(sid: str, idx: int, part: int, text: str) -> dict[str, Any]:
+        """Make the audio of one sentence of the partner. Never raises: a failure means the browser voice is used."""
+        if tts is None:
+            return {"part": part, "text": text, "audio_url": None, "voice_note": tts_error}
+        if db.tts_characters_since(day_ago()) + len(text) > settings.tts_max_chars_per_day:
+            events.write("tts.cap_reached", sid, cap=settings.tts_max_chars_per_day)
+            return {"part": part, "text": text, "audio_url": None,
+                    "voice_note": f"Daily voice cap reached (TTS_MAX_CHARS_PER_DAY={settings.tts_max_chars_per_day}); the browser voice is used."}
+        try:
+            started = time.monotonic()
+            r = await tts.speak(text)
+            ext = ".mp3" if "mpeg" in r.mime else ".wav" if "wav" in r.mime else ".bin"
+            (conv_dir / f"{sid}_{idx}_{part}{ext}").write_bytes(r.audio)
+            db.log_tts_call(sid, r.provider, r.model, r.characters)
+            events.write("tts.done", sid, idx=idx, part=part, characters=r.characters, provider=r.provider, model=r.model,
+                         seconds=round(time.monotonic() - started, 2))
+            return {"part": part, "text": text, "audio_url": f"/api/conversations/{sid}/turns/{idx}/audio?part={part}", "voice_note": None}
+        except TTSError as exc:
+            events.write("tts.error", sid, idx=idx, part=part, error=str(exc))
+            return {"part": part, "text": text, "audio_url": None, "voice_note": str(exc)}
 
-    async def partner_reply(sid: str, s: dict[str, Any], opening: bool) -> str:
+    def chat_prompt(sid: str, s: dict[str, Any], opening: bool) -> str:
+        scenario = s["topic_text"] or "A relaxed, friendly chat."
+        return opening_prompt(scenario) if opening else reply_prompt(scenario, db.get_turns(sid))
+
+    def chat_gate(sid: str) -> None:
         if chat_llm is None:
             raise HTTPException(503, chat_error or "No language model configured")
         if db.count_llm_calls_since(day_ago(), purpose="chat") >= settings.chat_max_per_day:
             events.write("chat.cap_reached", sid, cap=settings.chat_max_per_day)
             raise HTTPException(429, f"Daily cap of {settings.chat_max_per_day} partner replies reached (CHAT_MAX_PER_DAY).")
-        scenario = s["topic_text"] or "A relaxed, friendly chat."
-        prompt = opening_prompt(scenario) if opening else reply_prompt(scenario, db.get_turns(sid))
+
+    async def stream_partner(sid: str, s: dict[str, Any], opening: bool):
+        """Yield events: sentence (with its audio, in order), then done. The voice of sentence 2 is made while sentence 1 plays."""
+        chat_gate(sid)
+        prompt = chat_prompt(sid, s, opening)
         db.log_llm_call("chat", sid)
+        idx = None
         started = time.monotonic()
+        first_text_s = first_audio_s = None
+        buffer, sentences, jobs = "", [], []
+        idx = db.add_turn(sid, "partner", "")
+        words_budget = 60
+
+        def launch(text: str) -> None:
+            part = len(sentences)
+            sentences.append(text)
+            jobs.append(asyncio.create_task(speak_part(sid, idx, part, text)))
+
         try:
-            r = await chat_llm.complete(CONV_SYSTEM, prompt, 220)
+            async for piece in chat_llm.stream(CONV_SYSTEM, prompt, 220):
+                if first_text_s is None:
+                    first_text_s = round(time.monotonic() - started, 2)
+                buffer += piece
+                ready, buffer = split_ready(buffer)
+                for text in ready:
+                    if sum(len(x.split()) for x in sentences) >= words_budget:
+                        break
+                    launch(text)
+                    while jobs and jobs[0].done():
+                        out = jobs.pop(0).result()
+                        first_audio_s = first_audio_s or round(time.monotonic() - started, 2)
+                        yield {"type": "sentence", "idx": idx, **out}
+                    await asyncio.sleep(0)
         except LLMError as exc:
             events.write("chat.error", sid, error=str(exc))
-            raise HTTPException(502, str(exc)) from exc
-        text = clean_reply(r.text)
-        if not text:
+            for j in jobs:
+                j.cancel()
+            if not sentences:
+                db.set_turn_text(sid, idx, "")
+                raise HTTPException(502, str(exc)) from exc
+            yield {"type": "error", "message": str(exc)}
+        ready, buffer = split_ready(buffer, final=True)
+        for text in ready:
+            if sum(len(x.split()) for x in sentences) >= words_budget:
+                break
+            launch(text)
+        while jobs:
+            out = await jobs.pop(0)
+            first_audio_s = first_audio_s or round(time.monotonic() - started, 2)
+            yield {"type": "sentence", "idx": idx, **out}
+        full = " ".join(sentences).strip()
+        if not full:
             raise HTTPException(502, "The model returned an empty reply. Try again.")
-        events.write("chat.reply", sid, seconds=round(time.monotonic() - started, 2), model=r.model, usage=r.usage, opening=opening)
-        return text
+        db.set_turn_text(sid, idx, full)
+        events.write("chat.reply", sid, seconds=round(time.monotonic() - started, 2), first_text_s=first_text_s,
+                     first_audio_s=first_audio_s, model=chat_llm.model, sentences=len(sentences), opening=opening)
+        yield {"type": "done", "idx": idx, "first_text_s": first_text_s, "first_audio_s": first_audio_s,
+               "total_s": round(time.monotonic() - started, 2)}
 
     @app.get("/api/conversations/config")
     def conv_config() -> dict[str, Any]:
         return {"llm_ready": chat_llm is not None, "llm_error": chat_error, "voice": tts.name if tts else None,
                 "voice_model": tts.model if tts else None, "voice_note": tts_error,
-                "chat_model": chat_llm.model if chat_llm else None}
+                "chat_model": chat_llm.model if chat_llm else None,
+                "live_stt": settings.stt_provider == "assemblyai" and bool(settings.assemblyai_key)}
+
+    @app.get("/api/conversations/stream-token")
+    async def stream_token() -> dict[str, Any]:
+        """A short-lived token so the browser can send audio straight to AssemblyAI without ever seeing the real key."""
+        if settings.stt_provider != "assemblyai" or not settings.assemblyai_key:
+            raise HTTPException(503, "Live transcription needs STT_PROVIDER=assemblyai and its key.")
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get("https://streaming.assemblyai.com/v3/token", params={"expires_in_seconds": 300},
+                                     headers={"Authorization": settings.assemblyai_key})
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"token request failed: {exc}") from exc
+        if r.status_code >= 400:
+            events.write("conv.token_error", None, status=r.status_code, body=r.text[:300])
+            raise HTTPException(502, f"AssemblyAI refused the live token: HTTP {r.status_code}: {r.text[:300]}")
+        token = (r.json() or {}).get("token")
+        if not token:
+            raise HTTPException(502, "AssemblyAI returned no token")
+        return {"token": token, "url": "wss://streaming.assemblyai.com/v3/ws", "sample_rate": 16000}
 
     @app.post("/api/conversations", status_code=201)
     async def conv_start(body: ConvStart) -> dict[str, Any]:
-        if chat_llm is None:
-            raise HTTPException(503, chat_error or "No language model configured")
+        chat_gate("new")
         scenario = body.scenario.strip() or "A relaxed, friendly chat."
         if start_date() is None:
             db.set_setting("start_date", local_today().isoformat())
@@ -616,25 +680,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "client_info": json.dumps(body.client_info or {}, ensure_ascii=False), "group_id": None, "drill_round": None,
         })
         events.write("conv.start", sid, scenario=scenario, minutes=body.minutes, voice=tts.name if tts else None)
+        sentences = []
         try:
-            text = await partner_reply(sid, db.get_session(sid), opening=True)
+            async for ev in stream_partner(sid, db.get_session(sid), opening=True):
+                if ev["type"] == "sentence":
+                    sentences.append(ev)
         except HTTPException:
             db.update_session(sid, status="error", error="The partner could not start the conversation.")
             raise
-        turn = await partner_say(sid, text)
-        return {"id": sid, "scenario": scenario, "turn": turn}
+        return {"id": sid, "scenario": scenario, "sentences": sentences}
 
     @app.get("/api/conversations/{sid}/turns/{idx}/audio")
-    def conv_turn_audio(sid: str, idx: int) -> FileResponse:
+    def conv_turn_audio(sid: str, idx: int, part: int = 0) -> FileResponse:
         need_conv(sid)
-        for t in db.get_turns(sid):
-            if t["idx"] == idx and t["audio_path"] and Path(t["audio_path"]).is_file():
-                return FileResponse(t["audio_path"])
+        for f in conv_dir.glob(f"{sid}_{idx}_{part}.*"):
+            return FileResponse(f)
         raise HTTPException(404, "no audio for this turn")
+
+    async def batch_words(sid: str, idx: int, path: Path, mime: str, seconds: float) -> None:
+        """Transcribe a turn with the normal provider (timed words, fillers kept). Runs while the conversation goes on."""
+        try:
+            async with semaphore:
+                result = await provider.transcribe(path, mime, seconds)
+            if result.words:
+                db.set_turn_words(sid, idx, result.words, result.text)
+            events.write("conv.batch_stt", sid, idx=idx, words=len(result.words))
+        except Exception as exc:  # noqa: BLE001
+            events.write("conv.batch_stt_error", sid, idx=idx, error=str(exc))
 
     @app.post("/api/conversations/{sid}/turn")
     async def conv_turn(sid: str, file: UploadFile = File(...), duration_s: float = Form(...), mime: str = Form(""),
-                        latency_ms: int | None = Form(None)) -> dict[str, Any]:
+                        latency_ms: int | None = Form(None), live_text: str = Form("")) -> StreamingResponse:
         s = need_conv(sid)
         if s["status"] == "done":
             raise HTTPException(409, "this conversation is already finished")
@@ -646,14 +722,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lock = conv_locks.setdefault(sid, asyncio.Lock())
         if lock.locked():
             raise HTTPException(409, "the previous turn is still being handled")
-        async with lock:
-            blob = await file.read()
-            if not blob or len(blob) > settings.max_upload_bytes:
-                raise HTTPException(422, "empty or too large recording")
-            n = len([t for t in db.get_turns(sid) if t["role"] == "user"])
-            path = conv_dir / f"{sid}_user{n}{ALLOWED_MIME[base_mime]}"
-            path.write_bytes(blob)
-            started = time.monotonic()
+        blob = await file.read()
+        if not blob or len(blob) > settings.max_upload_bytes:
+            raise HTTPException(422, "empty or too large recording")
+        n = len([t for t in db.get_turns(sid) if t["role"] == "user"])
+        path = conv_dir / f"{sid}_user{n}{ALLOWED_MIME[base_mime]}"
+        path.write_bytes(blob)
+        live = " ".join(live_text.split())
+        started = time.monotonic()
+        stt_s, user_idx, text, words = 0.0, None, live, None
+        if not live:  # no live transcript: transcribe now, as before
             try:
                 result = await provider.transcribe(path, base_mime, duration_s)
             except Exception as exc:  # noqa: BLE001
@@ -661,27 +739,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(502, f"Transcription failed: {exc}") from exc
             stt_s = round(time.monotonic() - started, 2)
             events.write("conv.stt", sid, seconds=stt_s, words=len(result.words))
-            text = (result.text or "").strip()
-            if not result.words or not text:
-                return {"empty": True}
-            db.add_turn(sid, "user", text, words=result.words, audio_path=str(path), latency_ms=latency_ms,
-                        speech_ms=int(duration_s * 1000))
-            if db.get_session(sid)["status"] == "created":
-                db.update_session(sid, status="talking")
-            t1 = time.monotonic()
-            reply = await partner_reply(sid, s, opening=False)
-            t2 = time.monotonic()
-            turn = await partner_say(sid, reply)
-            t3 = time.monotonic()
-            timing = {"stt_s": stt_s, "llm_s": round(t2 - t1, 2), "voice_s": round(t3 - t2, 2), "total_s": round(t3 - started, 2)}
-            events.write("conv.turn_timing", sid, **timing)
-            return {"empty": False, "user_text": text, "turn": turn, "timing": timing}
+            text, words = (result.text or "").strip(), result.words
+            if not words or not text:
+                async def empty():
+                    yield json.dumps({"type": "empty"}) + "\n"
+                return StreamingResponse(empty(), media_type="application/x-ndjson")
+        user_idx = db.add_turn(sid, "user", text, words=words, audio_path=str(path), latency_ms=latency_ms, speech_ms=int(duration_s * 1000))
+        if words is None:  # the timed words come later, in the background
+            conv_tasks.setdefault(sid, []).append(asyncio.create_task(batch_words(sid, user_idx, path, base_mime, duration_s)))
+        if db.get_session(sid)["status"] == "created":
+            db.update_session(sid, status="talking")
+        events.write("conv.user_turn", sid, idx=user_idx, live=bool(live), words=len(text.split()))
+        chat_gate(sid)
+
+        async def body():
+            async with lock:
+                yield json.dumps({"type": "user", "text": text, "live": bool(live)}) + "\n"
+                try:
+                    async for ev in stream_partner(sid, s, opening=False):
+                        if ev["type"] == "done":
+                            ev["timing"] = {"stt_s": stt_s, "first_text_s": ev["first_text_s"], "first_audio_s": ev["first_audio_s"],
+                                            "total_s": ev["total_s"]}
+                            events.write("conv.turn_timing", sid, **ev["timing"], live=bool(live))
+                        yield json.dumps(ev) + "\n"
+                except HTTPException as exc:
+                    yield json.dumps({"type": "error", "message": exc.detail}) + "\n"
+        return StreamingResponse(body(), media_type="application/x-ndjson")
 
     @app.post("/api/conversations/{sid}/end")
-    def conv_end(sid: str) -> dict[str, Any]:
+    async def conv_end(sid: str) -> dict[str, Any]:
         s = need_conv(sid)
         if s["status"] == "done":
             return {"id": sid, "status": "done", "already": True}
+        pending = [t for t in conv_tasks.pop(sid, []) if not t.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=180)
         turns = db.get_turns(sid)
         words, text, seconds = stitch([t for t in turns if t["role"] == "user"])
         if not words:
@@ -696,12 +788,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if computed["values"]:
             db.save_metrics(sid, METRICS_VERSION, computed["values"])
         d = delays(turns)
+        missing = sum(1 for t in turns if t["role"] == "user" and not t["words"])
         db.update_session(sid, status="done", provider="conversation", transcript_path=str(transcript_path),
                           transcript_text=text, audio_seconds=seconds, client_seconds=seconds,
                           error=None if computed["values"] else f"No metrics computed: {', '.join(computed['flags'])}")
-        events.write("conv.end", sid, user_turns=len(d) or sum(1 for t in turns if t["role"] == "user"), speech_seconds=round(seconds, 1),
-                     delays_ms=d)
-        return {"id": sid, "status": "done", "delays_ms": d}
+        events.write("conv.end", sid, user_turns=sum(1 for t in turns if t["role"] == "user"), turns_without_words=missing,
+                     speech_seconds=round(seconds, 1), delays_ms=d)
+        return {"id": sid, "status": "done", "delays_ms": d, "turns_without_words": missing}
 
     @app.get("/api/conversations/{sid}")
     def conv_get(sid: str) -> dict[str, Any]:
