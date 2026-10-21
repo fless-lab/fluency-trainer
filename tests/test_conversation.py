@@ -60,3 +60,20 @@ def test_no_voice_falls_back(tmp_path):
     with TestClient(create_app(settings(tmp_path, tts_provider="none"))) as c:
         r = c.post("/api/conversations", json={"scenario": "chat"}).json()
         assert r["turn"]["audio_url"] is None and r["turn"]["voice_note"]
+
+
+def test_pcm_is_wrapped(monkeypatch):
+    import asyncio, httpx
+    from app.tts.openai_compat import OpenAICompatTTS
+
+    class R:
+        status_code = 200; content = b"\x00\x00" * 100; headers = {"content-type": "audio/pcm"}; text = ""
+
+    class C:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, *a, **k): return R()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **k: C())
+    out = asyncio.run(OpenAICompatTTS("openrouter", "k", "m", "v").speak("hello"))
+    assert out.mime == "audio/wav" and out.audio[:4] == b"RIFF"

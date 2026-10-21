@@ -7,6 +7,9 @@ service by me. A rejected request is raised as a TTSError with the provider's ow
 
 from __future__ import annotations
 
+import io
+import wave
+
 import httpx
 
 from .base import TTSError, TTSResult
@@ -31,4 +34,12 @@ class OpenAICompatTTS:
             raise TTSError(f"{self.name} tts: HTTP {r.status_code}: {r.text[:800]}")
         if not r.content:
             raise TTSError(f"{self.name} tts: empty audio in the response")
-        return TTSResult(self.name, self.model, r.content, r.headers.get("content-type", "audio/mpeg").split(";")[0], len(text))
+        mime = r.headers.get("content-type", "audio/mpeg").split(";")[0].strip().lower()
+        audio = r.content
+        if mime in ("audio/pcm", "audio/l16", "audio/x-pcm", "application/octet-stream"):
+            # raw 16-bit mono samples (24 kHz is the usual rate of speech models): wrap them so a browser can play them
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000); w.writeframes(audio)
+            audio, mime = buf.getvalue(), "audio/wav"
+        return TTSResult(self.name, self.model, audio, mime, len(text))
