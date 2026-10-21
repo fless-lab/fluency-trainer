@@ -603,7 +603,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             jobs.append(asyncio.create_task(speak_part(sid, idx, part, text)))
 
         try:
-            use_web = bool(db.get_setting(f"livesearch:{sid}")) and hasattr(chat_llm, "research")
+            use_web = bool(db.get_setting(f"livesearch:{sid}")) and hasattr(chat_llm, "research") and not opening
             for attempt in (0, 1):
                 try:
                     async for piece in chat_llm.stream(CONV_SYSTEM, prompt, 220 if not use_web else 400, web=use_web):
@@ -620,6 +620,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 first_audio_s = first_audio_s or round(time.monotonic() - started, 2)
                                 yield {"type": "sentence", "idx": idx, **out}
                             await asyncio.sleep(0)
+                    if first_text_s is None and use_web and attempt == 0:  # the search ended without any spoken text
+                        events.write("chat.empty_with_search", sid, debug=getattr(chat_llm, "last_debug", None))
+                        use_web = False
+                        continue
                     break
                 except LLMError as exc:
                     if use_web and attempt == 0 and first_text_s is None:  # the chat model may not support search: retry without
@@ -647,6 +651,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield {"type": "sentence", "idx": idx, **out}
         full = " ".join(sentences).strip()
         if not full:
+            events.write("chat.empty", sid, debug=getattr(chat_llm, "last_debug", None), buffer=buffer[:200])
             raise HTTPException(502, "The model returned an empty reply. Try again.")
         db.set_turn_text(sid, idx, full)
         events.write("chat.reply", sid, seconds=round(time.monotonic() - started, 2), first_text_s=first_text_s,

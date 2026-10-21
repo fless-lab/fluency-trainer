@@ -56,6 +56,7 @@ class AnthropicLLM:
         if web:  # the model decides by itself when a search is needed; the text after the search is streamed as usual
             body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
         headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        self.last_debug = {"events": {}, "stop_reason": None}
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 async with client.stream("POST", f"{self.base}/v1/messages", json=body, headers=headers) as r:
@@ -68,6 +69,10 @@ class AnthropicLLM:
                             ev = json.loads(line[5:].strip())
                         except ValueError:
                             continue
+                        kind = ev.get("type", "?") + ("/" + ev["delta"]["type"] if ev.get("type") == "content_block_delta" and "delta" in ev else "")
+                        self.last_debug["events"][kind] = self.last_debug["events"].get(kind, 0) + 1
+                        if ev.get("type") == "message_delta":
+                            self.last_debug["stop_reason"] = (ev.get("delta") or {}).get("stop_reason")
                         if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
                             yield ev["delta"].get("text", "")
                         elif ev.get("type") == "error":
