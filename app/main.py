@@ -627,7 +627,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             events.write("coach.start", sid, provider=llm.name, model=llm.model, version=COACH_VERSION)
             started = time.monotonic()
             try:
-                result = await llm.complete(system, user, 1800)
+                result = await llm.complete(system, user, 2600)
             except LLMError as exc:
                 events.write("coach.error", sid, error=str(exc))
                 raise HTTPException(502, str(exc)) from exc

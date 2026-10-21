@@ -21,6 +21,15 @@ DEFAULT_BASE = "https://api.anthropic.com"
 # Haiku thinks by default and the thinking counts against max_tokens: with the small budget of a spoken
 # reply the whole allowance went on thinking and the reply came back empty. Spoken replies need no thinking.
 NO_THINKING = {"type": "disabled"}
+# Sonnet 5 refuses "disabled" and says to send "between_tools" instead; without tools that means no thinking at all.
+# Left on, it spent about 900 of the 1800 tokens of a feedback answer thinking and the JSON was cut in half.
+NO_THINKING_SONNET = {"type": "between_tools"}
+
+
+def thinking_off(model: str) -> dict | None:
+    if "haiku" in model:
+        return NO_THINKING
+    return NO_THINKING_SONNET if "-5" in model else None  # older models: leave their default alone
 
 
 class AnthropicLLM:
@@ -38,9 +47,13 @@ class AnthropicLLM:
             "messages": [{"role": "user", "content": user}],
         }
         headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        body["thinking"] = thinking_off(self.model)
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 r = await client.post(f"{self.base}/v1/messages", json=body, headers=headers)
+                if r.status_code == 400 and "thinking" in r.text:  # a model that does not know this setting: ask without it
+                    body.pop("thinking")
+                    r = await client.post(f"{self.base}/v1/messages", json=body, headers=headers)
         except httpx.HTTPError as exc:
             raise LLMError(f"anthropic: network error: {exc}") from exc
         if r.status_code >= 400:
@@ -56,8 +69,7 @@ class AnthropicLLM:
         """Yield the answer piece by piece (server sent events: content_block_delta with delta.text)."""
         body = {"model": self.model, "max_tokens": max_tokens, "system": system, "stream": True,
                 "messages": [{"role": "user", "content": user}]}
-        if "haiku" in self.model:  # Sonnet does not think before replying and rejects this setting
-            body["thinking"] = NO_THINKING
+        body["thinking"] = thinking_off(self.model)
         if web:  # the model decides by itself when a search is needed; the text after the search is streamed as usual
             body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
         headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
