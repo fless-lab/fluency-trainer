@@ -585,15 +585,27 @@ async function setupGaps(root, detail) {
   box.querySelectorAll(".stuck-pt").forEach((b) => b.addEventListener("click", () => selectWord(Number(b.dataset.i))));
 }
 
+function renderPatterns(box, p) {
+  if (!p.patterns.length) { box.innerHTML = ""; return; }
+  const f = p.focus;
+  const ex = (t) => t.examples.slice(-1).map((e) => `<div class="small" style="margin:4px 0 0 12px"><span class="muted">You said:</span> “${esc(e.said)}” <span class="muted">Better:</span> “${esc(e.better)}”</div>`).join("");
+  box.innerHTML = `<h3 style="margin-top:0">What keeps coming back</h3>
+    ${f ? `<div class="card due"><div class="tag">Focus for now</div><p style="margin:4px 0"><strong>${esc(f.tag)}</strong>: ${esc(f.issue)}</p><p class="small muted" style="margin:0">Raised in ${f.recent_sessions} of your last sessions.</p>${ex(f)}</div>` : `<p class="muted small">No pattern has come up in two recent sessions yet.</p>`}
+    <div class="card scroll"><table><thead><tr><th>Pattern</th><th class="num">Sessions</th><th>Last seen</th></tr></thead><tbody>${p.patterns.slice(0, 8).map((t) => `<tr><td><strong>${esc(t.tag)}</strong><div class="small muted">${esc(t.issue)}</div></td><td class="num">${t.sessions}</td><td>${esc(t.last_seen)}</td></tr>`).join("")}</tbody></table></div>
+    <p class="small muted">Counted from the model's feedback, so two tags can describe the same idea. A guide, not a measurement.</p>`;
+}
+
 async function renderNotebook() {
   await refreshState();
   const [dueR, allR] = await Promise.all([api("/api/notebook?due=true"), api("/api/notebook")]);
   const llm = (STATE && STATE.llm) || {};
   view.innerHTML = `<h2>Notebook</h2>
     <p class="lead">Expressions you could not find while speaking. They come back on a widening schedule until you can say them without stopping.</p>
+    <div id="nb-patterns"></div>
     <div id="nb-due"></div>
     <div class="card"><h3>Add one yourself</h3><div class="row"><input type="text" id="nb-intent" placeholder="What do you want to be able to say?" size="50" maxlength="400"><input type="text" id="nb-english" placeholder="English version (optional)" size="40" maxlength="300"><button class="primary" id="nb-add">Add</button></div><p class="err small" id="nb-err"></p></div>
     <h3>All items</h3><div id="nb-all"></div>`;
+  try { renderPatterns($("#nb-patterns"), await api("/api/patterns")); } catch (_) {}
   const dueBox = $("#nb-due");
   const reviewable = dueR.items;
   if (!reviewable.length) dueBox.innerHTML = `<div class="card"><strong>Nothing due.</strong> <span class="muted small">Items appear here when their review date comes.</span></div>`;

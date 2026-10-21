@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import APP_VERSION
+from .patterns import build_patterns
 from .notebook import find_use, KINDS, RESULTS, build_suggest_messages, clean, context_around, now_iso, parse_suggestions, schedule_after
 from .coach import COACH_VERSION, MIN_WORDS, annotate_transcript, build_messages, parse_feedback
 from .config import Settings, load_settings
@@ -449,6 +450,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         metrics = {s["id"]: db.metrics_for(s["id"], METRICS_VERSION) for s in sessions if s["status"] == "done"}
         return build_progress(sessions, metrics, include_mock=include_mock)
 
+    @app.get("/api/patterns")
+    def patterns() -> dict[str, Any]:
+        return build_patterns(db.latest_coaching_per_session())
+
     @app.get("/api/sessions/{sid}/coach")
     def get_coaching(sid: str) -> dict[str, Any]:
         need_session(sid)
@@ -478,7 +483,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             tr = load_transcript(s)
             if tr and tr.get("words"):
                 annotated = annotate_transcript(tr["words"], compute_metrics(tr["words"])["pauses"])
-            system, user = build_messages(s, db.metrics_for(sid, METRICS_VERSION), s["transcript_text"], annotated)
+            known = build_patterns(db.latest_coaching_per_session())["known_tags"]
+            system, user = build_messages(s, db.metrics_for(sid, METRICS_VERSION), s["transcript_text"], annotated, known)
             events.write("coach.start", sid, provider=llm.name, model=llm.model, version=COACH_VERSION)
             started = time.monotonic()
             try:

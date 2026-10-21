@@ -255,6 +255,16 @@ class DB:
         out.pop("raw", None)
         return out
 
+    def latest_coaching_per_session(self) -> list[dict[str, Any]]:
+        """The newest feedback of every session, oldest session first, with the session date."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT c.session_id, s.local_date AS date, c.content FROM coaching c "
+                "JOIN sessions s ON s.id = c.session_id "
+                "WHERE c.id = (SELECT MAX(id) FROM coaching WHERE session_id = c.session_id) "
+                "ORDER BY s.created_at").fetchall()
+        return [{"session_id": r["session_id"], "date": r["date"], "content": json.loads(r["content"])} for r in rows]
+
     def count_coaching_since(self, iso_prefix: str) -> int:
         with self.conn() as c:
             return int(c.execute("SELECT COUNT(*) FROM coaching WHERE created_at >= ?", (iso_prefix,)).fetchone()[0])

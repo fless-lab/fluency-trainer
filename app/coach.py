@@ -47,7 +47,7 @@ def annotate_transcript(words: list[dict[str, Any]], pauses: list[dict[str, Any]
 
 
 def build_messages(session: dict[str, Any], metrics: dict[str, float], transcript: str,
-                   annotated: str | None = None) -> tuple[str, str]:
+                   annotated: str | None = None, known_tags: list[str] | None = None) -> tuple[str, str]:
     text = (annotated or transcript).strip()[:MAX_TRANSCRIPT_CHARS]
     parts = [f"Task given to the speaker: {session.get('topic_text') or 'free talk'}"]
     if session.get("kind") == "drill":
@@ -57,6 +57,9 @@ def build_messages(session: dict[str, Any], metrics: dict[str, float], transcrip
     shown = {k: round(metrics[k], 1) for k in keys if metrics.get(k) is not None}
     if shown:
         parts.append(f"Measured from the audio: {json.dumps(shown)}")
+    if known_tags:
+        parts.append("Pattern tags already used for this speaker: " + ", ".join(known_tags[:12]) +
+                     ". Reuse one of them exactly when the pattern is the same idea; create a new tag only when none fits.")
     parts.append(f"<transcript>\n{text}\n</transcript>")
     return SYSTEM_PROMPT, "\n".join(parts)
 
