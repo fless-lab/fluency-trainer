@@ -1013,17 +1013,62 @@ function playUrl(url, onBlocked, handle) {
 // token from our server. It only makes the reply start sooner. The timed words used for the measures still come from
 // the normal transcription of each recording, done in the background.
 const LIVE_MIN_FRAME = 1600;  // 100 ms at 16 kHz
-class LiveSTT {
-  constructor(ctx, stream) { this.ctx = ctx; this.stream = stream; this.ws = null; this.ready = false; this.sending = false; this.buffered = []; this.turns = {}; this.carry = []; this.pos = 0; this.pending = []; }
+// The input lane: the microphone is captured as raw audio all the time, with a memory of the last seconds. Everything that
+// listens to you reads from it (the recording of your turn, live transcription), so when you start talking, even over the
+// partner, the first words are not lost, and what is sent never contains more than the microphone heard.
+function wavBlob(f32, rate) {
+  const n = f32.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVE"); str(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) { const x = Math.max(-1, Math.min(1, f32[i])); v.setInt16(44 + i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true); }
+  return new Blob([buf], { type: "audio/wav" });
+}
+class InputLane {
+  constructor(ctx, stream, keepSeconds = 2.5) { this.ctx = ctx; this.stream = stream; this.keep = Math.floor(ctx.sampleRate * keepSeconds); this.ring = []; this.ringN = 0; this.turn = null; this.taps = []; }
   async init() {
     if (!this.ctx.audioWorklet) return false;
     const src = "class P extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true}}registerProcessor('pcm-tap',P);";
     const url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
     try { await this.ctx.audioWorklet.addModule(url); } catch (_) { return false; }
     this.node = new AudioWorkletNode(this.ctx, "pcm-tap");
-    this.node.port.onmessage = (e) => this.onAudio(e.data);
+    this.node.port.onmessage = (e) => this.push(e.data);
     const mute = this.ctx.createGain(); mute.gain.value = 0;
     this.ctx.createMediaStreamSource(this.stream).connect(this.node); this.node.connect(mute); mute.connect(this.ctx.destination);
+    return true;
+  }
+  push(f) {
+    this.ring.push(f); this.ringN += f.length;
+    while (this.ring.length > 1 && this.ringN - this.ring[0].length >= this.keep) this.ringN -= this.ring.shift().length;
+    if (this.turn) this.turn.push(f);
+    for (const t of this.taps) t(f);
+  }
+  startTurn(preMs) {  // begin your turn preMs before now; returns that earlier audio so live transcription can have it too
+    const need = Math.floor(this.ctx.sampleRate * preMs / 1000), pre = []; let n = 0;
+    for (let i = this.ring.length - 1; i >= 0 && n < need; i--) { pre.unshift(this.ring[i]); n += this.ring[i].length; }
+    this.turn = [...pre];
+    return pre;
+  }
+  cancelTurn() { this.turn = null; }
+  async endTurn() {  // your turn as a 16 kHz mono wav
+    const chunks = this.turn || []; this.turn = null;
+    const n = chunks.reduce((a, c) => a + c.length, 0), rate = this.ctx.sampleRate;
+    if (!n) return null;
+    const buf = new AudioBuffer({ length: n, numberOfChannels: 1, sampleRate: rate });
+    const ch = buf.getChannelData(0); let o = 0; for (const c of chunks) { ch.set(c, o); o += c.length; }
+    const off = new OfflineAudioContext(1, Math.ceil(n * 16000 / rate), 16000);
+    const src = off.createBufferSource(); src.buffer = buf; src.connect(off.destination); src.start();
+    const out = (await off.startRendering()).getChannelData(0);
+    return { blob: wavBlob(out, 16000), seconds: n / rate };
+  }
+}
+
+class LiveSTT {
+  constructor(ctx, stream, lane) { this.ctx = ctx; this.stream = stream; this.lane = lane; this.ws = null; this.ready = false; this.sending = false; this.buffered = []; this.turns = {}; this.carry = []; this.pos = 0; this.pending = []; }
+  async init() {
+    if (!this.lane) return false;
+    this.lane.taps.push((f) => this.onAudio(f));
     return true;
   }
   onAudio(f32) {
@@ -1061,7 +1106,7 @@ class LiveSTT {
       this.buffered = [];
     } catch (e) { logEvent("live_stt_unavailable", { error: String(e) }); this.ready = false; }
   }
-  listen() { this.sending = true; }
+  listen(pre = []) { this.sending = true; for (const f of pre) this.onAudio(f); }  // pre: audio from just before you started
   heard() { return Object.keys(this.turns).map(Number).sort((x, y) => x - y).map((k) => this.turns[k]).join(" ").replace(/\s+/g, " ").trim(); }
   async finish() {  // stop sending, ask AssemblyAI to close the open turn, and return everything it heard
     this.sending = false;
@@ -1125,7 +1170,9 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   PLAYBACK.analyser = ctx.createAnalyser(); PLAYBACK.analyser.fftSize = 1024; PLAYBACK.buf = new Float32Array(1024);
   PLAYBACK.analyser.connect(ctx.destination); PLAYBACK.ctx = ctx;
   const cfg = await api("/api/conversations/config").catch(() => ({}));
-  const live = cfg.live_stt ? new LiveSTT(ctx, stream) : null;
+  const lane = new InputLane(ctx, stream);
+  if (!(await lane.init())) { stopMic(); stage.innerHTML = `<p class="err">This browser cannot capture the microphone for a conversation (no AudioWorklet).</p>`; return; }
+  const live = cfg.live_stt ? new LiveSTT(ctx, stream, lane) : null;
   const liveOk = live ? await live.init() : false;
 
   // the partner's first line
@@ -1255,11 +1302,6 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
 
   while (!over) {
     setPhase("you", auto ? "Your turn. I answer when you pause." : "Your turn. Press “I'm done” when you finish."); doneBtn.disabled = false; doneNow = false; const startedByBarge = bargedIn; bargedIn = false;
-    if (liveOk) live.listen();
-    const mt = pickMime();
-    const rec = new MediaRecorder(stream, mt ? { mimeType: mt } : undefined);
-    const chunks = []; rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-    rec.start(500);
     const turnStart = performance.now();
     let spoke = false, firstSpeechAt = null, lastVoiceAt = performance.now(), voiceMs = 0, endReason = "button";
     while (!over && !doneNow) {
@@ -1267,7 +1309,11 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
       const now = performance.now();
       // the first 0.35 s after the partner stops are ignored: its own voice can still come back through the microphone
       const echoGrace = !startedByBarge && now - turnStart < 350;
-      if (!echoGrace && isVoice()) { if (spoke && now - lastVoiceAt >= 600) maxInnerPause = Math.max(maxInnerPause, now - lastVoiceAt); voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 240) { spoke = true; firstSpeechAt = now - 240; setPhase("you", auto ? "Listening… I answer when you pause." : "Listening… press “I'm done” when you finish."); } }
+      if (!echoGrace && isVoice()) { if (spoke && now - lastVoiceAt >= 600) maxInnerPause = Math.max(maxInnerPause, now - lastVoiceAt); voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 240) {
+        spoke = true; firstSpeechAt = now - 240;
+        const pre = lane.startTurn(startedByBarge ? 1800 : 900);  // your turn starts a little before you were noticed: no first word is lost
+        if (liveOk) live.listen(pre);
+        setPhase("you", auto ? "Listening… I answer when you pause." : "Listening… press “I'm done” when you finish."); } }
       if (auto && spoke) {
         // like a voice assistant: answer soon after a finished sentence, wait longer when you are still searching for words
         const heard = liveOk ? live.heard() : "", quiet = now - lastVoiceAt;
@@ -1277,9 +1323,9 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
       }
       if (now - turnStart > 150000) { endReason = "cap"; break; }
     }
-    const durationS = (performance.now() - turnStart) / 1000;
+    const turnAudio = spoke ? await lane.endTurn() : (lane.cancelTurn(), null);
+    const durationS = turnAudio ? turnAudio.seconds : (performance.now() - turnStart) / 1000;
     logEvent("conv_turn_end", { reason: doneNow ? "button" : endReason, auto, last_words: liveOk ? live.heard().split(/\s+/).slice(-6).join(" ") : null, inner_pause_ms: Math.round(maxInnerPause), spoke, voice_ms: voiceMs, seconds: Math.round(durationS * 10) / 10, heard_words: liveOk ? live.heard().split(/\s+/).filter(Boolean).length : null, neural_vad: vadOk }, sid);
-    await new Promise((resolve) => { rec.onstop = resolve; if (rec.state !== "inactive") rec.stop(); });
     if (over) break;
     if (!spoke && startedByBarge) {  // interrupted, then silence: the "voice" was probably the echo
       falseBarges += 1;
@@ -1289,8 +1335,8 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
     setPhase("thinking", "…"); doneBtn.disabled = true;
     const liveText = liveOk ? await live.finish() : "";
     const fd = new FormData();
-    fd.append("file", new Blob(chunks, { type: rec.mimeType || "audio/webm" }), "turn.webm");
-    fd.append("duration_s", String(durationS)); fd.append("mime", (rec.mimeType || "audio/webm").split(";")[0]);
+    fd.append("file", turnAudio.blob, "turn.wav");
+    fd.append("duration_s", String(durationS)); fd.append("mime", "audio/wav");
     fd.append("latency_ms", String(Math.max(0, Math.round(firstSpeechAt - partnerEndedAt))));
     fd.append("live_text", liveText);
     const sentAt = performance.now();
