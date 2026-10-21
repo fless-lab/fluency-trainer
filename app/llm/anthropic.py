@@ -18,6 +18,9 @@ import httpx
 from .base import LLMError, LLMResult
 
 DEFAULT_BASE = "https://api.anthropic.com"
+# Haiku thinks by default and the thinking counts against max_tokens: with the small budget of a spoken
+# reply the whole allowance went on thinking and the reply came back empty. Spoken replies need no thinking.
+NO_THINKING = {"type": "disabled"}
 
 
 class AnthropicLLM:
@@ -53,6 +56,8 @@ class AnthropicLLM:
         """Yield the answer piece by piece (server sent events: content_block_delta with delta.text)."""
         body = {"model": self.model, "max_tokens": max_tokens, "system": system, "stream": True,
                 "messages": [{"role": "user", "content": user}]}
+        if "haiku" in self.model:  # Sonnet does not think before replying and rejects this setting
+            body["thinking"] = NO_THINKING
         if web:  # the model decides by itself when a search is needed; the text after the search is streamed as usual
             body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
         headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
