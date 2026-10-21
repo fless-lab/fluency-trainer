@@ -33,6 +33,7 @@ from .coach import COACH_VERSION, MIN_WORDS, annotate_transcript, build_messages
 from . import config
 from .config import ROOT, Settings, load_settings
 from . import settings_admin as sadm
+from . import backup as bk
 from .db import DB
 from .eventlog import EventLog, utcnow
 from .metrics import METRICS_VERSION, compute_metrics
@@ -309,7 +310,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             events.write("process.recover", s["id"], previous_status=s["status"])
             tasks.append(asyncio.create_task(process_session(s["id"])))
         app.state.tasks = tasks
+        daily = asyncio.create_task(backup_daily())
         yield
+        daily.cancel()
         events.write("app.stop", None)
 
     app = FastAPI(title="Fluency Trainer", version=APP_VERSION, lifespan=lifespan)
@@ -603,6 +606,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not seg:
             raise HTTPException(404, "nothing at that time")
         return Response(pron.to_wav(seg), media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+
+    # backups -----------------------------------------------------------------------------------------
+    backup_dir = data / "backups"
+
+    @app.get("/api/backups")
+    def backups_list(request: Request) -> dict[str, Any]:
+        local_only(request)
+        return {"items": bk.list_backups(backup_dir), "folder": str(backup_dir)}
+
+    @app.post("/api/backups", status_code=201)
+    async def backups_make(request: Request, full: bool = False) -> dict[str, Any]:
+        """Make a backup now: light (database, transcripts, log) or full (with your recordings too)."""
+        local_only(request)
+        name = f"backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}{'' if full else '-light'}.zip"
+        info = await asyncio.to_thread(bk.make_backup, data, backup_dir / name, full, APP_VERSION)
+        events.write("backup.made", None, kind=info["kind"], files=info["files"], size=info["size"], manual=True)
+        return {"name": name, "size": info["size"], "kind": info["kind"], "files": info["files"]}
+
+    @app.get("/api/backups/{name}")
+    def backups_download(name: str, request: Request) -> FileResponse:
+        local_only(request)
+        path = (backup_dir / name).resolve()
+        if backup_dir.resolve() not in path.parents or path.suffix != ".zip" or not path.is_file():
+            raise HTTPException(404, "no such backup")
+        return FileResponse(path, media_type="application/zip", filename=name)
+
+    async def backup_daily() -> None:
+        """One light backup a day, kept for two weeks: a copy exists even if you never think about it."""
+        while True:
+            try:
+                if bk.automatic_due(backup_dir):
+                    name = f"auto-{datetime.now().strftime('%Y%m%d')}.zip"
+                    info = await asyncio.to_thread(bk.make_backup, data, backup_dir / name, False, APP_VERSION)
+                    removed = bk.prune_automatic(backup_dir)
+                    events.write("backup.made", None, kind="light", files=info["files"], size=info["size"], manual=False, pruned=len(removed))
+            except Exception as exc:  # noqa: BLE001 - a failed backup must never stop the app
+                events.write("backup.error", None, error=str(exc)[:300])
+            await asyncio.sleep(6 * 3600)
 
     # settings screen -------------------------------------------------------------------------------
     env_path = ROOT / ".env"

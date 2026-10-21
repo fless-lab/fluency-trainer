@@ -1025,12 +1025,35 @@ async function renderSettings() {
 }
 
 // ---------------------------------------------------------------- data
+const fmtBytes = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+
+async function renderBackups(box) {
+  let r;
+  try { r = await api("/api/backups"); } catch (_) { box.innerHTML = ""; return; }
+  const rows = r.items.map((b) => `<tr><td><a href="/api/backups/${encodeURIComponent(b.name)}" download>${esc(b.name)}</a></td><td class="num">${fmtBytes(b.size)}</td><td class="small muted">${esc(b.modified.replace("T", " ").slice(0, 16))}</td></tr>`).join("");
+  box.innerHTML = `<div class="card"><h3>Backups</h3>
+    <p class="small muted" style="margin-top:0">A light backup (database, transcripts, log) is made by itself every day and the last 14 are kept. Make a full one, with all your recordings, before moving to another computer or changing anything big. They are kept in <code>${esc(r.folder)}</code>.</p>
+    <div class="row"><button class="primary" id="bk-full">Full backup now (with recordings)</button><button class="secondary" id="bk-light">Light backup now</button><span class="small muted" id="bk-msg"></span></div>
+    ${rows ? `<div class="scroll"><table style="margin-top:10px"><thead><tr><th>Backup</th><th>Size</th><th>Made</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="small muted">None yet.</p>`}
+    <p class="small muted">To restore, close the app and run in a terminal: <code>python -m app.backup restore backup.zip --to ./data-restored</code>, look at the result, then use that folder as <code>DATA_DIR</code>. It never overwrites a folder that already has data.</p></div>`;
+  const make = async (full) => {
+    $("#bk-msg", box).textContent = full ? "Making the full backup… it can take a moment." : "Making the backup…";
+    $("#bk-full", box).disabled = $("#bk-light", box).disabled = true;
+    try { await api(`/api/backups?full=${full}`, { method: "POST" }); logEvent("backup_made", { full }); renderBackups(box); }
+    catch (e) { $("#bk-msg", box).innerHTML = `<span class="err">${esc(e.message)}</span>`; $("#bk-full", box).disabled = $("#bk-light", box).disabled = false; }
+  };
+  $("#bk-full", box).addEventListener("click", () => make(true));
+  $("#bk-light", box).addEventListener("click", () => make(false));
+}
+
 async function renderData() {
   await refreshState();
   view.innerHTML = `<h2>Data</h2><p class="lead">Everything is stored on this computer, in the data folder next to the app.</p>
     <div class="card"><div class="row"><a class="secondary" href="/api/export" download>Export sessions and metrics (JSON)</a><a class="secondary" href="/api/export?detail=true" download>Detailed export: every word, pause and flag (JSON)</a><a class="secondary" href="/api/events.jsonl" download>Download the full event log</a></div>
     <p class="small muted">Every action is logged: sessions, uploads, transcription attempts and errors, recording events and microphone problems. Recordings and raw transcripts are never deleted by the app.</p></div>
+    <div id="backups"></div>
     <div class="card"><h3>Counter</h3><p class="small">Start date: ${esc(STATE.start_date || "not started")} · app ${esc(STATE.version)} · metrics definitions v${esc(STATE.metrics_version)}</p><button class="secondary" id="reset-start">Set start date to today</button></div>`;
+  renderBackups($("#backups"));
   $("#reset-start").addEventListener("click", async () => { if (confirm("Reset the 30 day counter to today?")) { await api("/api/start", { method: "POST", body: {} }); show("data"); } });
 }
 
