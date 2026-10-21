@@ -596,6 +596,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "nothing at that time")
         return Response(pron.to_wav(seg), media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
 
+    @app.get("/api/pronunciation/progress")
+    def pronunciation_progress() -> dict[str, Any]:
+        """How the scored sessions compare over time (oldest first)."""
+        items = []
+        for sess in reversed(db.list_sessions()):  # list_sessions is newest first
+            if sess["status"] != "done" or sess.get("provider") == "mock":
+                continue
+            units = azure_units(sess["id"])
+            if units:
+                items.append({"id": sess["id"], "date": sess["local_date"], "kind": sess["kind"], "summary": pron.aggregate(units)})
+        return pron.trends(items)
+
     @app.get("/api/sessions/{sid}/pronunciation/lesson")
     def get_lesson(sid: str) -> dict[str, Any]:
         need_session(sid)

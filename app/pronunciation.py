@@ -212,8 +212,9 @@ def aggregate(units: list[dict[str, Any]]) -> dict[str, Any]:
             weak_sounds.append({"sound": p, "mean": round(mean, 1), "count": len(vals),
                                 "weak_count": sum(1 for v in vals if v < PHONEME_WEAK_BELOW), "words": examples.get(p, [])})
     weak_sounds.sort(key=lambda s: s["mean"])
+    sounds = {p: {"mean": round(sum(v) / len(v), 1), "n": len(v)} for p, v in per_ph.items()}  # every sound, for the trends
     return {"version": PRON_VERSION, "seconds": round(seconds, 1), "n_words": len(all_words_all),
-            "scores": {k: _wavg(v) for k, v in scores.items()}, "worst_words": worst, "weak_sounds": weak_sounds[:6]}
+            "scores": {k: _wavg(v) for k, v in scores.items()}, "worst_words": worst, "weak_sounds": weak_sounds[:6], "sounds": sounds}
 
 
 def for_coach(summary: dict[str, Any] | None) -> str:
@@ -306,3 +307,59 @@ def ear_for_coach(ear: dict[str, Any] | None) -> str:
     if ear.get("overall"):
         lines.append("Overall rhythm, stress and intonation: " + ear["overall"])
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------- progress over several sessions
+
+TREND_MIN_WORDS = 30  # a session shorter than this says too little about the sounds
+SOUND_MIN_PER_SESSION = 3
+SOUND_MIN_TOTAL = 12
+TREND_STEP = 8.0  # points of average score: smaller changes are called steady
+TREND_MIN_WORDS_PER_SIDE = 8  # the early part and the recent part of the comparison each need this many words with the sound
+
+
+def _avg(xs: list[float]) -> float:
+    return sum(xs) / len(xs)
+
+
+def trends(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pronunciation across sessions, oldest first. Each item: {"id", "date", "kind", "summary": aggregate(...)}.
+    Reports the three scores per session, the weakest sounds with whether they get better or worse, and the words that
+    are weak again and again."""
+    from .lesson import IPA
+    used = [s for s in sessions if (s["summary"] or {}).get("n_words", 0) >= TREND_MIN_WORDS]
+    score_series: dict[str, list[dict[str, Any]]] = {"AccuracyScore": [], "FluencyScore": [], "ProsodyScore": []}
+    per_sound: dict[str, list[dict[str, Any]]] = {}
+    words: dict[str, dict[str, Any]] = {}
+    for s in used:
+        sm = s["summary"]
+        for k, series in score_series.items():
+            v = (sm.get("scores") or {}).get(k)
+            if isinstance(v, (int, float)):
+                series.append({"id": s["id"], "date": s["date"], "v": v})
+        for p, st in (sm.get("sounds") or {}).items():
+            if st["n"] >= SOUND_MIN_PER_SESSION:
+                per_sound.setdefault(p, []).append({"id": s["id"], "date": s["date"], "mean": st["mean"], "n": st["n"]})
+        for w in sm.get("worst_words", []):
+            e = words.setdefault(w["word"].lower(), {"word": w["word"], "sessions": 0, "scores": [], "last": None})
+            e["sessions"] += 1
+            e["scores"].append(w["score"])
+            e["last"] = {"id": s["id"], "unit": w["unit"], "t": w["t"], "d": w.get("d") or 1.0}
+    sounds = []
+    for p, pts in per_sound.items():
+        if len(pts) < 2 or sum(x["n"] for x in pts) < SOUND_MIN_TOTAL:
+            continue
+        means = [x["mean"] for x in pts]
+        k = max(1, len(means) // 3)
+        early, recent = pts[:k], pts[-k:]
+        wavg = lambda g: sum(x["mean"] * x["n"] for x in g) / sum(x["n"] for x in g)  # noqa: E731 - weighted by words
+        enough = len(pts) >= 3 and sum(x["n"] for x in early) >= TREND_MIN_WORDS_PER_SIDE and sum(x["n"] for x in recent) >= TREND_MIN_WORDS_PER_SIDE
+        delta = round(wavg(recent) - wavg(early), 1) if enough else None
+        trend = None if delta is None else "improving" if delta >= TREND_STEP else "declining" if delta <= -TREND_STEP else "steady"
+        sounds.append({"sound": p, "ipa": IPA.get(p, p), "mean": round(_avg(means), 1), "latest": means[-1], "delta": delta,
+                       "trend": trend, "sessions": len(pts), "points": pts})
+    sounds.sort(key=lambda x: x["mean"])
+    recurring = [{"word": e["word"], "sessions": e["sessions"], "mean": round(_avg(e["scores"]), 1), "last": e["last"]}
+                 for e in words.values() if e["sessions"] >= 2]
+    recurring.sort(key=lambda e: (-e["sessions"], e["mean"]))
+    return {"n_sessions": len(used), "scores": score_series, "sounds": sounds[:8], "recurring_words": recurring[:10]}

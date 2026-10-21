@@ -189,3 +189,53 @@ def test_lesson_route_makes_stores_and_reuses_the_lesson(tmp_path, monkeypatch):
         assert first["reused"] is False and first["lesson"]["focus"][0]["your_words"] == ["vision", "children"]
         again = c.post(f"/api/sessions/{sid}/pronunciation/lesson").json()
         assert again["reused"] is True and c.get(f"/api/sessions/{sid}/pronunciation/lesson").json()["lesson"] == first["lesson"]
+
+
+def _session_summary(th, zh, extra_word=None, n=60, th_count=9):
+    """An aggregate for a session where /th/ averaged `th` and /zh/ averaged `zh`, spread over n words."""
+    words = [(f"think{i}", th, [("th", th)]) for i in range(th_count)]
+    words += [(f"vision{i}", zh, [("zh", zh)]) for i in range(th_count)]
+    if extra_word:
+        words.append((extra_word, 30, [("ae", 30)]))
+    words += [(f"word{i}", 95, [("k", 95)]) for i in range(n - len(words))]
+    return pr.aggregate([{"seconds": 60.0, "unit": "s", "chunks": [{**pr.summarize_chunk(_azure(words), 0.0), "seconds": 60.0}]}])
+
+
+def test_trends_show_better_worse_steady_and_words_that_keep_coming_back():
+    plan = [(50, 80, "bank"), (55, 80, "bank"), (62, 79, None), (70, 80, "bank")]  # /th/ gains 20 points, /zh/ stays
+    sessions = [{"id": f"s{i}", "date": f"2026-10-{10 + i}", "kind": "free", "summary": _session_summary(th, zh, w)}
+                for i, (th, zh, w) in enumerate(plan)]
+    sessions.append({"id": "short", "date": "2026-10-20", "kind": "free", "summary": _session_summary(10, 10, n=6)})  # too short: ignored
+    out = pr.trends(sessions)
+    assert out["n_sessions"] == 4
+    by = {s["sound"]: s for s in out["sounds"]}
+    assert by["th"]["trend"] == "improving" and by["th"]["delta"] >= 8 and by["zh"]["trend"] == "steady"
+    assert [s["sound"] for s in out["sounds"]][0] == "th"  # weakest first
+    bank = next(w for w in out["recurring_words"] if w["word"] == "bank")
+    assert bank["sessions"] == 3 and bank["last"]["id"] == "s3"  # weak in three of the four sessions, last heard in the latest
+    assert len(out["scores"]["AccuracyScore"]) == 4
+
+
+def test_trends_need_enough_data_before_calling_a_direction(tmp_path):
+    two = [{"id": f"s{i}", "date": f"2026-10-1{i}", "kind": "free", "summary": _session_summary(50 + 20 * i, 80)} for i in range(2)]
+    out = pr.trends(two)
+    th = next(s for s in out["sounds"] if s["sound"] == "th")
+    assert th["trend"] is None and th["delta"] is None  # two sessions are not a trend
+    assert pr.trends([])["n_sessions"] == 0
+
+
+def test_progress_route_ignores_mock_sessions_and_answers(tmp_path):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from tests.test_api import record
+    with TestClient(create_app(_settings(tmp_path))) as c:
+        record(c)  # a mock-transcribed session never counts
+        out = c.get("/api/pronunciation/progress").json()
+        assert out["n_sessions"] == 0 and out["sounds"] == [] and out["recurring_words"] == []
+
+
+def test_a_big_change_on_very_few_words_is_not_called_a_trend():
+    sessions = [{"id": f"s{i}", "date": f"2026-10-1{i}", "kind": "free", "summary": _session_summary(th, 80, th_count=3)}
+                for i, th in enumerate((90, 60, 40, 30))]  # falls by 60 points, but only 3 words per session
+    th = next(s for s in pr.trends(sessions)["sounds"] if s["sound"] == "th")
+    assert th["trend"] is None  # 3 words on each side is not enough to say anything

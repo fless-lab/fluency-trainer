@@ -908,7 +908,45 @@ async function renderProgress() {
   view.innerHTML = `<h2>Progress</h2><p class="lead">Averages over three topics per checkpoint. A change only counts when it is larger than the noise column (the gap between your day 0 and day 2 baselines).</p>
     <div class="card scroll"><table><thead><tr><th>Metric</th><th>Day 0</th><th>Day 2</th><th>Noise</th><th>Day 15</th><th>Change vs baseline</th><th>Day 30</th><th>Change vs baseline</th></tr></thead><tbody>${rows}</tbody></table></div>
     <p class="small muted">Topics recorded: day 0 ${cps.base0.n_topics}/${cps.base0.topics_expected}, day 2 ${cps.base2.n_topics}/${cps.base2.topics_expected}, day 15 ${cps.day15.n_topics}/${cps.day15.topics_expected}, day 30 ${cps.day30.n_topics}/${cps.day30.topics_expected}.${mock ? " Mock sessions included." : ""}</p>
+    <div id="pron-progress"></div>
     ${repeats}${drillHtml}<h3>How to read this</h3><ul>${p.notes.map((n) => `<li class="small">${esc(n)}</li>`).join("")}</ul>`;
+  pronunciationProgressHtml().then((html) => { const box = $("#pron-progress"); if (box) box.innerHTML = html; });
+}
+
+// ---------------------------------------------------------------- pronunciation over time
+function spark(values, w = 110, h = 26) {
+  if (values.length < 2) return "";
+  const lo = Math.min(...values), hi = Math.max(...values), span = Math.max(hi - lo, 8);
+  const pts = values.map((v, i) => `${(i / (values.length - 1)) * (w - 6) + 3},${h - 3 - ((v - lo) / span) * (h - 6)}`).join(" ");
+  const last = pts.split(" ").pop().split(",");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true" style="vertical-align:middle"><polyline fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="${pts}"/><circle cx="${last[0]}" cy="${last[1]}" r="3" fill="currentColor"/></svg>`;
+}
+
+async function pronunciationProgressHtml() {
+  let t;
+  try { t = await api("/api/pronunciation/progress"); } catch (_) { return ""; }
+  const head = `<h3>Pronunciation over time</h3>`;
+  if (t.n_sessions < 2) {
+    return `${head}<p class="small muted">Scored from the audio by Azure. It needs at least two long enough scored sessions to compare (${t.n_sessions} so far). Each session you record is scored automatically.</p>`;
+  }
+  const tiles = [["AccuracyScore", "Sounds"], ["FluencyScore", "Flow"], ["ProsodyScore", "Intonation"]].map(([k, label]) => {
+    const v = t.scores[k].map((x) => x.v);
+    if (!v.length) return "";
+    const d = v.length >= 3 ? v[v.length - 1] - v[0] : null;
+    return `<div class="card" style="flex:1 1 150px;margin:0"><div class="tag">${label}</div><div style="font-size:26px;font-weight:800">${Math.round(v[v.length - 1])}</div><div class="muted">${spark(v)}</div><div class="small muted">${v.length} sessions${d == null ? "" : `, ${d >= 0 ? "+" : ""}${Math.round(d)} since the first`}</div></div>`;
+  }).join("");
+  const arrow = { improving: ["↑", "ok", "getting better"], declining: ["↓", "bad", "getting worse"], steady: ["→", "mid", "steady"] };
+  const sounds = t.sounds.map((x) => {
+    const a = x.trend ? arrow[x.trend] : null;
+    return `<tr><td><strong>/${esc(x.ipa)}/</strong> <span class="muted small">${esc(x.sound)}</span></td><td class="num">${Math.round(x.mean)}</td><td class="muted">${spark(x.points.map((q) => q.mean), 90, 22)}</td>
+      <td>${a ? `<span class="chip ${a[1]}" title="${esc(a[2])}">${a[0]} ${x.delta >= 0 ? "+" : ""}${x.delta}</span>` : '<span class="small muted">too early</span>'}</td><td class="num small muted">${x.sessions}</td></tr>`;
+  }).join("");
+  const recurring = t.recurring_words.map((w) => `<span style="display:inline-block;margin:3px 10px 3px 0">${sayable(w.word)} <span class="small muted">${w.sessions} sessions · ${Math.round(w.mean)}</span> <button class="secondary mini" data-clip="/api/sessions/${esc(w.last.id)}/clip?unit=${encodeURIComponent(w.last.unit)}&t=${w.last.t}&d=${w.last.d || 1}" title="Hear yourself, last time">You</button></span>`).join("");
+  return `${head}<p class="small muted">The score of each sound averaged over the words of each session (0 to 100). A direction is only given after three sessions, with at least 8 words on each side of the comparison, and only when the change is 8 points or more.</p>
+    <div class="row" style="gap:10px;margin:8px 0">${tiles}</div>
+    ${sounds ? `<div class="card scroll"><table><thead><tr><th>Sound</th><th>Average</th><th>Over time</th><th>Change</th><th>Sessions</th></tr></thead><tbody>${sounds}</tbody></table></div>` : ""}
+    ${recurring ? `<h4 style="margin:14px 0 4px">Words that keep coming back</h4><p style="margin:0">${recurring}</p>` : ""}
+    <p class="small muted">A guide, not a verdict: a score also depends on the recording, the topic and how fast you spoke, so small changes mean little.</p>`;
 }
 
 // ---------------------------------------------------------------- data
