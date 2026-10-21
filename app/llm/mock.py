@@ -25,7 +25,8 @@ class MockLLM:
                       "tip": ""}
             return LLMResult("mock", "mock", json.dumps(answer), {"input_tokens": 0, "output_tokens": 0})
         m = re.search(r"<transcript>\n(.*?)\n</transcript>", user, re.S)
-        words = (m.group(1) if m else "").split()
+        text = re.sub(r"\[(?:pause|unsure) [^\]]*\]", " ", m.group(1) if m else "")  # whole markers out, never cut in half
+        words = text.split()
         quote = " ".join(words[:6]) or "no transcript"
         answer = {
             "summary": "Mock feedback: this is a placeholder, not a real analysis.",
