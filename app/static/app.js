@@ -219,20 +219,26 @@ function statusTag(sessions) {
 async function renderToday() {
   await refreshState();
   const pending = await pendingAll();
-  let html = `<h2>Today</h2><p class="lead">Each test is 30 seconds of preparation, then 2 minutes of speaking. Do not write anything down. Speak the way you would to a person.</p>`;
+  let html = `<h2>Today</h2>`;
   if (pending.length) html += `<div class="card"><strong>${pending.length} recording(s) saved on this device are not uploaded yet.</strong> <button class="secondary" id="retry-pending">Upload now</button></div>`;
   if (STATE.notebook_due) html += `<div class="card due"><strong>${STATE.notebook_due} notebook item(s) to review.</strong> <button class="secondary" id="go-nb">Review now</button></div>`;
   if (STATE.day === null) html += `<p class="muted small">The 30 day counter starts when you record your first session. You can also <a href="#" id="start-today">start it today</a>.</p>`;
+  // practice first: what you do most
+  html += await conversationCard();
+  html += `<div class="grid2">
+    <div class="card"><h3>Free monologue</h3><p class="muted small">Talk about anything. Measured like the tests, but kept out of the comparison.</p><div class="row"><input type="text" id="free-topic" placeholder="Topic (optional)" size="26"><select id="free-length"><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option></select><button class="primary" id="free-start">Start</button></div></div>
+    <div class="card"><h3>4/3/2 drill</h3><p class="muted small">The same story in 4, then 3, then 2 minutes: the shrinking time pushes you to find your words faster. About 10 minutes. Training, not a test.</p><div class="row"><select id="drill-topic">${(STATE.drill_topics || []).map((t) => `<option value="${esc(t.text)}">${esc(t.text)}</option>`).join("")}<option value="">My own topic…</option></select></div><div class="row" style="margin-top:8px"><input type="text" id="drill-custom" placeholder="Your topic" size="30" hidden><button class="primary" id="drill-start">Start</button></div></div>
+  </div>`;
+  // the 30 day tests, folded: only the one that is due is open
+  html += `<h3 style="margin-top:22px">The 30 day tests</h3><p class="muted small" style="margin-top:0">Each test is 30 seconds of preparation, then 2 minutes of speaking. Do not write anything down. Speak the way you would to a person.</p>`;
   for (const cp of STATE.checkpoints) {
-    html += `<div class="card ${cp.due ? "due" : ""}"><div class="row spread"><h3>${esc(cp.label)}</h3><span class="tag">${cp.due ? "due" : `from day ${cp.due_day}`}</span></div><p class="muted small">${esc(cp.hint)}</p>`;
+    const done = cp.topics.filter((t) => t.sessions.some((x) => x.status === "done")).length;
+    html += `<details class="card fold ${cp.due ? "due" : ""}" ${cp.due ? "open" : ""}><summary><h3>${esc(cp.label)}</h3><span class="tag">${cp.due ? "due" : `from day ${cp.due_day}`}</span><span class="small muted">${done} of ${cp.topics.length} done</span></summary><p class="muted small">${esc(cp.hint)}</p>`;
     for (const t of cp.topics) {
       html += `<div class="topic"><div><div class="tag">${esc(t.type)}${t.is_repeat ? " · repeated from day 0" : ""}</div><p>${esc(t.text)}</p></div><div class="row">${statusTag(t.sessions)}<button class="primary" data-cp="${esc(cp.id)}" data-topic="${esc(t.topic_id)}">${t.sessions.length ? "Record again" : "Start"}</button></div></div>`;
     }
-    html += `</div>`;
+    html += `</details>`;
   }
-  html += `<div class="card"><h3>Free monologue</h3><p class="muted small">Talk about anything. Logged and measured like the tests, but kept out of the checkpoint comparison.</p><div class="row"><input type="text" id="free-topic" placeholder="Topic (optional)" size="40"><select id="free-length"><option value="120">2 min</option><option value="300">5 min</option><option value="600">10 min</option></select><button class="primary" id="free-start">Start</button></div></div>`;
-  html += `<div class="card"><h3>4/3/2 drill</h3><p class="muted small">Tell the same story three times, in 4, then 3, then 2 minutes. Same content each time, nothing new added. The shrinking time pushes you to find your words faster. About 10 minutes in all. This is training, not a test: it is kept out of the checkpoint comparison.</p><div class="row"><select id="drill-topic">${(STATE.drill_topics || []).map((t) => `<option value="${esc(t.text)}">${esc(t.text)}</option>`).join("")}<option value="">My own topic…</option></select></div><div class="row" style="margin-top:8px"><input type="text" id="drill-custom" placeholder="Your topic" size="50" hidden><button class="primary" id="drill-start">Start</button></div></div>`;
-  html += await conversationCard();
   view.innerHTML = html;
   wireConversationCard();
   $("#drill-topic").addEventListener("change", (e) => { const c = $("#drill-custom"); c.hidden = e.target.value !== ""; if (!c.hidden) c.focus(); });
@@ -530,24 +536,35 @@ function renderSessionDetail(container, detail) {
     .map(([k, label, d]) => `<tr><td>${esc(label)}</td><td class="num">${fmt(detail.metrics[k], d)}</td></tr>`).join("");
   const flags = (detail.flags || []).map((f) => ({ short_sample: "Short sample: treat the numbers with care.", no_fillers_found: "No fillers found. The provider may have removed them, which would understate your hesitations.", too_short: "Too little speech to compute metrics." }[f] || f));
   const wrap = document.createElement("div");
+  const PANES = [["overview", "Result"], ["transcript", "Transcript"], ["pron", "Pronunciation"], ["feedback", "Feedback"], ["notes", "Notes"]];
   wrap.innerHTML = `
     <h2>Result</h2>
     <p class="muted small">${esc(detail.topic_text || "Free monologue")} · ${esc(detail.provider || "no provider")}${detail.provider === "mock" ? " (invented transcript)" : ""} · ${fmt(detail.client_seconds, 0)} s recorded</p>
-    ${flags.length ? `<div class="banner" style="margin:10px 0;border-radius:8px">${flags.map(esc).join("<br>")}</div>` : ""}
-    <div class="card scroll"><table><tbody>${rows || '<tr><td class="muted">No metrics.</td></tr>'}</tbody></table></div>
-    <h3>Transcript</h3>
-    <div class="legend">Pause chips: <span class="chip mid">mid-clause</span> <span class="chip boundary">clause boundary</span> <span class="chip long">over 1 s</span> · <span class="filler">fillers</span>. Classification is a heuristic.</div>
-    <div class="card transcript" id="tr">${renderTranscript(detail)}</div>
-    <div id="uses"></div>
-    <div id="gaps"></div>
-    ${detail.has_audio ? `<audio id="sess-audio" controls preload="none" src="/api/sessions/${esc(detail.id)}/audio" style="width:100%"></audio>` : ""}
-    <div id="pron"></div>
-    <div id="coach"></div>
+    <div class="seg subtabs" role="tablist">${PANES.map(([id, label], i) => `<button role="tab" data-pane="${id}" class="${i ? "" : "on"}">${label}</button>`).join("")}</div>
+    <section data-panel="overview">
+      ${flags.length ? `<div class="banner" style="margin:10px 0;border-radius:8px">${flags.map(esc).join("<br>")}</div>` : ""}
+      ${detail.has_audio ? `<audio id="sess-audio" controls preload="none" src="/api/sessions/${esc(detail.id)}/audio" style="width:100%;margin-top:10px"></audio>` : ""}
+      <div class="card scroll"><table><tbody>${rows || '<tr><td class="muted">No metrics.</td></tr>'}</tbody></table></div>
+    </section>
+    <section data-panel="transcript" hidden>
+      <div class="legend">Pause chips: <span class="chip mid">mid-clause</span> <span class="chip boundary">clause boundary</span> <span class="chip long">over 1 s</span> · <span class="filler">fillers</span>. Classification is a heuristic.</div>
+      <div class="card transcript" id="tr">${renderTranscript(detail)}</div>
+      <div id="uses"></div>
+      <div id="gaps"></div>
+    </section>
+    <section data-panel="pron" hidden><div id="pron"></div></section>
+    <section data-panel="feedback" hidden><div id="coach"></div></section>
+    <section data-panel="notes" hidden>
     <h3>How did it feel?</h3>
     <div class="row"><select id="fb-rating"><option value="">Rating…</option>${[1, 2, 3, 4, 5].map((n) => `<option value="${n}" ${detail.self_rating === n ? "selected" : ""}>${n}${n === 1 ? " (very hard)" : n === 5 ? " (easy)" : ""}</option>`).join("")}</select></div>
     <textarea id="fb-notes" placeholder="Notes: what blocked you, words you could not find, anything you avoided saying">${esc(detail.notes || "")}</textarea>
-    <div class="row" style="margin-top:8px"><button class="secondary" id="fb-save">Save notes</button><span id="fb-msg" class="muted small"></span></div>`;
+    <div class="row" style="margin-top:8px"><button class="secondary" id="fb-save">Save notes</button><span id="fb-msg" class="muted small"></span></div>
+    </section>`;
   container.appendChild(wrap);
+  wrap.querySelectorAll("[data-pane]").forEach((b) => b.addEventListener("click", () => {
+    wrap.querySelectorAll("[data-pane]").forEach((x) => x.classList.toggle("on", x === b));
+    wrap.querySelectorAll("[data-panel]").forEach((x) => { x.hidden = x.dataset.panel !== b.dataset.pane; });
+  }));
   setupPron(wrap, detail);
   setupCoach(wrap, detail);
   setupUses(wrap, detail);
@@ -926,7 +943,8 @@ async function renderProgress() {
     <div class="card scroll"><table><thead><tr><th>Metric</th><th>Day 0</th><th>Day 2</th><th>Noise</th><th>Day 15</th><th>Change vs baseline</th><th>Day 30</th><th>Change vs baseline</th></tr></thead><tbody>${rows}</tbody></table></div>
     <p class="small muted">Topics recorded: day 0 ${cps.base0.n_topics}/${cps.base0.topics_expected}, day 2 ${cps.base2.n_topics}/${cps.base2.topics_expected}, day 15 ${cps.day15.n_topics}/${cps.day15.topics_expected}, day 30 ${cps.day30.n_topics}/${cps.day30.topics_expected}.${mock ? " Mock sessions included." : ""}</p>
     <div id="pron-progress"></div>
-    ${repeats}${drillHtml}<h3>How to read this</h3><ul>${p.notes.map((n) => `<li class="small">${esc(n)}</li>`).join("")}</ul>`;
+    ${repeats || drillHtml ? `<details class="card fold"><summary><h3>Repeated topics and 4/3/2 drills</h3></summary>${repeats}${drillHtml}</details>` : ""}
+    <details class="card fold"><summary><h3>How to read this</h3></summary><ul>${p.notes.map((n) => `<li class="small">${esc(n)}</li>`).join("")}</ul></details>`;
   pronunciationProgressHtml().then((html) => { const box = $("#pron-progress"); if (box) box.innerHTML = html; });
 }
 
@@ -983,8 +1001,15 @@ async function renderSettings() {
     else control = `<input type="text" id="${id}" data-key="${f.key}" value="${esc(f.value)}" placeholder="${esc(f.placeholder)}" size="44" autocomplete="off">`;
     return `<div style="margin:10px 0"><label for="${id}"><strong>${esc(f.label)}</strong></label>${pending}<br>${control}${f.help ? `<div class="small muted">${esc(f.help)}</div>` : ""}</div>`;
   };
-  const groups = r.groups.map((g) => `<div class="card"><h3>${esc(g.title)}</h3><p class="muted small" style="margin-top:0">${esc(g.blurb)}</p>${g.fields.map(input).join("")}
-    ${(SETTINGS_CHECKS[g.id] || []).length ? `<div class="row">${SETTINGS_CHECKS[g.id].map(([svc, label]) => `<button class="secondary" data-check="${svc}">${label}</button>`).join("")}</div>${SETTINGS_CHECKS[g.id].map(([svc]) => `<div class="small" data-res="${svc}" style="margin-top:6px"></div>`).join("")}` : ""}</div>`).join("");
+  const MAIN = { stt: ["STT_PROVIDER"], llm: ["LLM_PROVIDER", "LLM_MODEL"], voice: ["TTS_PROVIDER", "TTS_MODEL"], pron: ["AZURE_SPEECH_REGION", "NATIVE_LANGUAGE"], limits: ["COACH_MAX_PER_DAY"] };
+  const brief = (g) => {
+    const vals = (MAIN[g.id] || []).map((k) => g.fields.find((f) => f.key === k)).filter(Boolean).map((f) => f.value).filter(Boolean);
+    const keys = g.fields.filter((f) => f.kind === "secret");
+    const state = keys.length ? (keys.some((f) => f.set) ? "key saved" : "no key") : "";
+    return [...vals, state].filter(Boolean).join(" · ");
+  };
+  const groups = r.groups.map((g) => `<details class="card fold" ${g.fields.some((f) => f.pending) ? "open" : ""}><summary><h3>${esc(g.title)}</h3><span class="small muted">${esc(brief(g))}</span></summary><p class="muted small" style="margin-top:0">${esc(g.blurb)}</p>${g.fields.map(input).join("")}
+    ${(SETTINGS_CHECKS[g.id] || []).length ? `<div class="row">${SETTINGS_CHECKS[g.id].map(([svc, label]) => `<button class="secondary" data-check="${svc}">${label}</button>`).join("")}</div>${SETTINGS_CHECKS[g.id].map(([svc]) => `<div class="small" data-res="${svc}" style="margin-top:6px"></div>`).join("")}` : ""}</details>`).join("");
   view.innerHTML = `<h2>Settings</h2><p class="lead">Everything the app needs to work, in one place. It is saved in the <code>.env</code> file next to the app (${esc(r.env_file)}): keys stay on this computer and are never shown again here, only their last four characters. A change applies after a restart.</p>
     <div id="st-banner"></div>${groups}
     <div class="row" style="margin:14px 0"><button class="primary" id="st-save">Save</button><span class="small muted" id="st-msg"></span></div>`;
@@ -1516,10 +1541,16 @@ async function conversationCard() {
   const cfg = await api("/api/conversations/config").catch(() => null);
   if (!cfg) return "";
   const ready = cfg.llm_ready;
-  return `<div class="card"><h3>Talk with a partner</h3><p class="muted small">A spoken conversation. The partner asks, you answer out loud, you choose whether you press “I'm done” or it answers by itself when your sentence is finished (and waits when you hesitate), and you can talk over it to interrupt. Your speech is measured like any other session, then you get the same feedback. ${ready ? "" : `<span class="err">Not available: ${esc(cfg.llm_error || "no language model")}</span>`}</p>
-    <div class="row"><select id="conv-scn">${SCENARIOS.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}<option value="">My own scenario…</option></select><select id="conv-len"><option value="5">5 min</option><option value="10" selected>10 min</option><option value="20">20 min</option></select><select id="conv-wait" title="Who decides that you have finished speaking"><option value="0" selected>I press “I'm done”</option><option value="6000">Auto, patient</option><option value="4000">Auto, natural</option><option value="2500">Auto, quick</option></select></div>
-    <div class="row" style="margin-top:8px"><input type="text" id="conv-custom" placeholder="Describe the situation" size="50" hidden><button class="primary" id="conv-start" ${ready ? "" : "disabled"}>Start</button></div>
-    <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-barge" checked> Let me interrupt the partner by talking over it (it measures its own echo; if it keeps firing by mistake it switches itself off)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label><p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
+  return `<div class="card hero"><h3>Talk with a partner</h3><p class="muted small" style="margin-top:0">A spoken conversation: the partner answers, you talk. ${ready ? "" : `<span class="err">Not available: ${esc(cfg.llm_error || "no language model")}</span>`}</p>
+    <div class="row"><select id="conv-scn">${SCENARIOS.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}<option value="">My own scenario…</option></select><select id="conv-len"><option value="5">5 min</option><option value="10" selected>10 min</option><option value="20">20 min</option></select><button class="primary" id="conv-start" ${ready ? "" : "disabled"}>Start</button></div>
+    <div class="row" style="margin-top:8px"><input type="text" id="conv-custom" placeholder="Describe the situation" size="50" hidden></div>
+    <details class="more"><summary>Options</summary>
+      <div class="row" style="margin-top:8px"><label class="small" for="conv-wait">Who decides that you have finished</label><select id="conv-wait"><option value="0" selected>I press “I'm done”</option><option value="6000">Auto, patient</option><option value="4000">Auto, natural</option><option value="2500">Auto, quick</option></select></div>
+      <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-barge" checked> Let me interrupt the partner by talking over it (it measures its own echo; if it keeps firing by mistake it switches itself off)</label>
+      <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label>
+      <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label>
+      <p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p>
+    </details></div>`;
 }
 
 function wireConversationCard() {

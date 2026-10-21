@@ -255,3 +255,17 @@ body.calm .confetti { display: none; }
 .hear { margin-left: 6px; white-space: nowrap; }
 button.mini { padding: 0 9px; font-size: 12px; line-height: 20px; margin-right: 4px; box-shadow: 2px 2px 0 var(--ink); }
 button.mini.saying { background: var(--yellow); color: #1d1b38; }
+
+/* folded blocks, practice cards, tabs inside a page */
+details.fold > summary, details.more > summary { cursor: pointer; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; list-style: none; }
+details.fold > summary::-webkit-details-marker, details.more > summary::-webkit-details-marker { display: none; }
+details.fold > summary::before, details.more > summary::before { content: "\25B8"; font-size: 14px; transition: transform .15s; }
+details.fold[open] > summary::before, details.more[open] > summary::before { transform: rotate(90deg); }
+details.fold > summary h3 { margin: 0; }
+details.more { margin-top: 10px; }
+details.more > summary { font-weight: 700; font-size: 14px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin: 14px 0; }
+.grid2 > .card { margin: 0; }
+.card.hero { border-width: 4px; }
+.subtabs { margin: 12px 0; flex-wrap: wrap; }
+@media (max-width: 560px) { .subtabs { border-radius: 18px; } }
