@@ -988,9 +988,21 @@ function speakBrowser(text) {
   });
 }
 
+// What the app plays goes through this analyser during a conversation: knowing the exact sound that leaves the speaker,
+// the app can tell its own voice coming back into the microphone from the person talking (what an assistant on a phone does).
+const PLAYBACK = { ctx: null, analyser: null, buf: null };
+function playbackLevel() {
+  if (!PLAYBACK.analyser) return 0;
+  PLAYBACK.analyser.getFloatTimeDomainData(PLAYBACK.buf);
+  let sum = 0; for (const v of PLAYBACK.buf) sum += v * v;
+  return Math.sqrt(sum / PLAYBACK.buf.length);
+}
 function playUrl(url, onBlocked, handle) {
   return new Promise((resolve) => {
     const a = new Audio(url);
+    if (PLAYBACK.ctx && PLAYBACK.analyser) {
+      try { PLAYBACK.ctx.createMediaElementSource(a).connect(PLAYBACK.analyser); if (handle) handle.ref = true; } catch (_) {}
+    }
     a.onended = a.onerror = () => resolve();
     if (handle) handle.stop = () => { a.pause(); resolve(); };
     a.play().catch(() => { onBlocked && onBlocked(); resolve(); });
@@ -1110,6 +1122,8 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
 
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   try { await ctx.resume(); } catch (_) {}
+  PLAYBACK.analyser = ctx.createAnalyser(); PLAYBACK.analyser.fftSize = 1024; PLAYBACK.buf = new Float32Array(1024);
+  PLAYBACK.analyser.connect(ctx.destination); PLAYBACK.ctx = ctx;
   const cfg = await api("/api/conversations/config").catch(() => ({}));
   const live = cfg.live_stt ? new LiveSTT(ctx, stream) : null;
   const liveOk = live ? await live.init() : false;
@@ -1166,7 +1180,7 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   const add = (who, text) => { const d = document.createElement("div"); d.className = `say-${who}`; d.textContent = text; say.appendChild(d); say.scrollTop = say.scrollHeight; return d; };
   $("#end", stage).addEventListener("click", () => { ending = true; doneNow = true; });
   doneBtn.addEventListener("click", () => { doneNow = true; });
-  let partnerPlayer = null, bargedIn = false;
+  let partnerPlayer = null, bargedIn = false, bargeOn = !!bargeIn, bargeCount = 0, falseBarges = 0;
   const interrupt = () => { if (partnerPlayer) { bargedIn = true; partnerPlayer.stop(); } };
   interruptBtn.addEventListener("click", interrupt);
 
@@ -1182,23 +1196,31 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   await sleep(300);
   let ambient = 0; for (let i = 0; i < 6; i++) { ambient = Math.max(ambient, level()); await sleep(50); }
   const threshold = Math.min(0.08, Math.max(0.02, ambient * 3));
-  // Interrupting by voice: you have to be clearly louder than the partner's own voice coming back through the microphone
-  // (the peaks of its level, measured while it talks) and sound like speech, in most of the last 0.8 s. Speech has gaps, so
-  // it is a count over a window and not an unbroken stretch. With headphones the echo is close to nothing.
-  let echoPeak = 0, partnerSince = 0, recent = [];
+  // Interrupting by voice. While the partner's voice plays, the app knows the exact sound going out (PLAYBACK). Its own voice
+  // coming back into the microphone is about a fixed fraction of that sound (the "echo ratio", learned in the first
+  // moments of each reply). You are talking when the microphone is clearly louder than that fraction predicts, and it
+  // sounds like speech, in most of the last 0.8 s. Without that reference (browser voice) only the button interrupts.
+  let partnerSince = 0, recent = [], refHist = [], ratios = [], ratio = 0;
   const watch = setInterval(() => {  // also draws the microphone level
     const lv = level(), nowMs = performance.now();
     meter.style.width = `${Math.min(100, Math.round((lv / Math.max(threshold * 3, 0.06)) * 100))}%`;
-    if (!partnerPlayer) { partnerSince = 0; echoPeak = 0; recent = []; return; }
-    if (!partnerPlayer.isPlaying()) { partnerSince = 0; recent = []; return; }  // measure the echo only while its voice is really playing
+    if (!partnerPlayer || !partnerPlayer.isPlaying() || !partnerPlayer.hasRef()) { partnerSince = 0; recent = []; refHist = []; if (!partnerPlayer) { ratios = []; ratio = 0; } return; }
     if (!partnerSince) partnerSince = nowMs;
-    const calibrating = nowMs - partnerSince < 700;
-    const floor = Math.max(threshold * 1.5, echoPeak * 1.8);
-    const loud = (vadOk ? vadProb > 0.5 : true) && lv > floor;
-    if (calibrating || lv <= echoPeak * 1.3) echoPeak = Math.max(echoPeak * 0.998, lv);  // much louder than the echo's peaks: that is you, not the echo
+    refHist.push(playbackLevel()); if (refHist.length > 4) refHist.shift();
+    const ref = Math.max(...refHist);  // the echo arrives a little after the sound leaves: look back 0.3 s
+    const calibrating = nowMs - partnerSince < 900;
+    let loud = false;
+    if (ref > 0.004) {
+      const r = lv / ref;
+      if (calibrating) { ratios.push(r); ratios.sort((x, y) => x - y); ratio = ratios[Math.floor(ratios.length / 2)]; }
+      else if (r <= ratio * 1.6) ratio = ratio * 0.97 + r * 0.03;  // follows slow changes, never learns your voice as echo
+      loud = !calibrating && (vadOk ? vadProb > 0.5 : true) && lv > Math.max(threshold * 1.5, ratio * ref * 2.5);
+    } else if (!calibrating) {
+      loud = (vadOk ? vadProb > 0.8 : false) && lv > threshold * 3;  // its voice is silent for a moment: only a clear voice counts
+    }
     recent.push(loud); if (recent.length > 10) recent.shift();
-    if (bargeIn && !calibrating && recent.length === 10 && recent.filter(Boolean).length >= 6) {
-      recent = []; logEvent("conv_barge_in", { level: Math.round(lv * 1000) / 1000, echo_peak: Math.round(echoPeak * 1000) / 1000 }, sid); interrupt();
+    if (bargeOn && !calibrating && recent.length === 10 && recent.filter(Boolean).length >= 6) {
+      recent = []; bargeCount += 1; logEvent("conv_barge_in", { level: Math.round(lv * 1000) / 1000, echo_ratio: Math.round(ratio * 1000) / 1000, ref: Math.round(ref * 1000) / 1000 }, sid); interrupt();
     }
   }, 80);
   const isVoice = () => (vadOk ? vadProb > 0.5 : level() > threshold);
@@ -1224,7 +1246,7 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
       }
     })();
     const stop = () => { stopped = true; finished = true; queue.length = 0; if (cur.stop) cur.stop(); window.speechSynthesis && window.speechSynthesis.cancel(); if (wake) { const w = wake; wake = null; w(); } };
-    return { stop, isPlaying: () => playing, push: (sn) => { if (!stopped) queue.push(sn); if (wake) { const w = wake; wake = null; w(); } }, end: () => { finished = true; if (wake) { const w = wake; wake = null; w(); } }, done: run };
+    return { stop, isPlaying: () => playing, hasRef: () => !!cur.ref, push: (sn) => { if (!stopped) queue.push(sn); if (wake) { const w = wake; wake = null; w(); } }, end: () => { finished = true; if (wake) { const w = wake; wake = null; w(); } }, done: run };
   };
   let partnerEndedAt = performance.now();
   setPhase("partner", "Your partner is speaking…"); interruptBtn.hidden = false;
@@ -1232,7 +1254,7 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
   { const pl = makePlayer(); partnerPlayer = pl; first.sentences.forEach(pl.push); pl.end(); await pl.done; partnerPlayer = null; interruptBtn.hidden = true; partnerEndedAt = performance.now(); }
 
   while (!over) {
-    setPhase("you", auto ? "Your turn. I answer when you pause." : "Your turn. Press “I'm done” when you finish."); doneBtn.disabled = false; doneNow = false; bargedIn = false;
+    setPhase("you", auto ? "Your turn. I answer when you pause." : "Your turn. Press “I'm done” when you finish."); doneBtn.disabled = false; doneNow = false; const startedByBarge = bargedIn; bargedIn = false;
     if (liveOk) live.listen();
     const mt = pickMime();
     const rec = new MediaRecorder(stream, mt ? { mimeType: mt } : undefined);
@@ -1244,7 +1266,7 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
       await sleep(80);
       const now = performance.now();
       // the first 0.35 s after the partner stops are ignored: its own voice can still come back through the microphone
-      const echoGrace = !bargedIn && now - turnStart < 350;
+      const echoGrace = !startedByBarge && now - turnStart < 350;
       if (!echoGrace && isVoice()) { if (spoke && now - lastVoiceAt >= 600) maxInnerPause = Math.max(maxInnerPause, now - lastVoiceAt); voiceMs += 80; lastVoiceAt = now; if (!spoke && voiceMs >= 240) { spoke = true; firstSpeechAt = now - 240; setPhase("you", auto ? "Listening… I answer when you pause." : "Listening… press “I'm done” when you finish."); } }
       if (auto && spoke) {
         // like a voice assistant: answer soon after a finished sentence, wait longer when you are still searching for words
@@ -1259,6 +1281,10 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
     logEvent("conv_turn_end", { reason: doneNow ? "button" : endReason, auto, last_words: liveOk ? live.heard().split(/\s+/).slice(-6).join(" ") : null, inner_pause_ms: Math.round(maxInnerPause), spoke, voice_ms: voiceMs, seconds: Math.round(durationS * 10) / 10, heard_words: liveOk ? live.heard().split(/\s+/).filter(Boolean).length : null, neural_vad: vadOk }, sid);
     await new Promise((resolve) => { rec.onstop = resolve; if (rec.state !== "inactive") rec.stop(); });
     if (over) break;
+    if (!spoke && startedByBarge) {  // interrupted, then silence: the "voice" was probably the echo
+      falseBarges += 1;
+      if (falseBarges >= 2 && bargeOn) { bargeOn = false; logEvent("conv_barge_disabled", { false_barges: falseBarges }, sid); note.textContent = "Interrupting by voice is switched off: it kept firing without you speaking (use headphones, or the Interrupt button)."; }
+    }
     if (!spoke) { if (ending) break; continue; }  // nothing said: keep waiting, nothing is sent
     setPhase("thinking", "…"); doneBtn.disabled = true;
     const liveText = liveOk ? await live.finish() : "";
@@ -1289,7 +1315,7 @@ async function runConversation(scenario, minutes, patienceMs, research, liveSear
     if (errMsg) { stateEl.innerHTML = `<span class="err">${esc(errMsg)}</span> Say it again, or end the conversation.`; if (liveOk && !ending) live.begin(); if (ending) break; continue; }
     if (ending || (performance.now() - t0) / 60000 >= minutes) break;
   }
-  clearInterval(tick); clearInterval(watch); if (vadInst) { try { vadInst.destroy(); } catch (_) {} } stopMic(); if (live) live.close(); ctx.close();
+  clearInterval(tick); clearInterval(watch); if (vadInst) { try { vadInst.destroy(); } catch (_) {} } stopMic(); if (live) live.close(); PLAYBACK.ctx = null; PLAYBACK.analyser = null; ctx.close();
   if (over) return;
   stage.innerHTML = `<p class="muted">Finishing… the last recordings are being transcribed.</p>`;
   const end = await api(`/api/conversations/${sid}/end`, { method: "POST", body: {} }).catch((e) => ({ status: "error", error: e.message }));
@@ -1311,7 +1337,7 @@ async function conversationCard() {
   return `<div class="card"><h3>Talk with a partner</h3><p class="muted small">A spoken conversation. The partner asks, you answer out loud, you choose whether you press “I'm done” or it answers by itself when your sentence is finished (and waits when you hesitate), and you can talk over it to interrupt. Your speech is measured like any other session, then you get the same feedback. ${ready ? "" : `<span class="err">Not available: ${esc(cfg.llm_error || "no language model")}</span>`}</p>
     <div class="row"><select id="conv-scn">${SCENARIOS.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}<option value="">My own scenario…</option></select><select id="conv-len"><option value="5">5 min</option><option value="10" selected>10 min</option><option value="20">20 min</option></select><select id="conv-wait" title="Who decides that you have finished speaking"><option value="0" selected>I press “I'm done”</option><option value="6000">Auto, patient</option><option value="4000">Auto, natural</option><option value="2500">Auto, quick</option></select></div>
     <div class="row" style="margin-top:8px"><input type="text" id="conv-custom" placeholder="Describe the situation" size="50" hidden><button class="primary" id="conv-start" ${ready ? "" : "disabled"}>Start</button></div>
-    <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-barge"> Let me interrupt the partner by talking over it (headphones only: with speakers its own voice can cut it off)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label><p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
+    <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-barge" checked> Let me interrupt the partner by talking over it (it measures its own echo; if it keeps firing by mistake it switches itself off)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-live"> Let the partner search the web during the conversation when it needs a fact (those turns answer a few seconds slower, about a cent per search)</label><label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="conv-research"> Let the partner read up on the topic first (searches the web, a few seconds and about a cent)</label><p class="small muted">Voice: ${cfg.voice ? `${esc(cfg.voice)} (${esc(cfg.voice_model || "")})` : esc(cfg.voice_note || "browser voice")}</p></div>`;
 }
 
 function wireConversationCard() {
